@@ -10,15 +10,17 @@ if (typeof Flac !== 'undefined') {
 
 let accessHandle = null;
 let fileHandle = null;
-let dataChannel = null;
 let workletPort = null;
 
-let guestAccessHandle = null;
-let guestFileHandle = null;
+// Per-guest OPFS file state, keyed by guestId (their peerId).
+let guestFiles = new Map();
 
 let readOffset = 0;
 let extractFileSize = 0;
 const CHUNK_SIZE = 16 * 1024;
+
+// Track which guest we're currently reading chunks from during extraction.
+let activeReadGuestId = null;
 
 // Polls until libFLAC is fully initialized and ready to use.
 async function waitFlac() {
@@ -67,7 +69,7 @@ async function compressFile(sourceFileHandle, compressedFileHandle, sampleRate) 
     writeHandle.close();
 }
 
-async function decompressFile(compressedFileHandle, decompressedFileHandle) {
+async function decompressFile(compressedFileHandle, decompressedFileHandle, guestId) {
     const compFile = await compressedFileHandle.getFile();
     
     const writeHandle = await decompressedFileHandle.createSyncAccessHandle();
@@ -84,11 +86,11 @@ async function decompressFile(compressedFileHandle, decompressedFileHandle) {
             if (size === 0) return { readDataLength: 0, buffer: new Uint8Array(0) };
             const chunk = fileBuffer.slice(readOffset, readOffset + size);
             readOffset += size;
-            self.postMessage({ type: 'DECOMPRESS_PROGRESS', current: readOffset, total: fileBuffer.length });
+            self.postMessage({ type: 'DECOMPRESS_PROGRESS', current: readOffset, total: fileBuffer.length, guestId });
             return { readDataLength: size, buffer: chunk };
         },
         function(data, frameInfo){
-            // `data` is an array of Uint8Arrays, one per channel.
+            // data is an array of Uint8Arrays, one per channel.
             // The encoder used 16-bit signed PCM integers, so we convert back to Float32.
             const channelBytes = data[0]; 
             const view = new DataView(channelBytes.buffer, channelBytes.byteOffset, channelBytes.byteLength);
@@ -114,21 +116,27 @@ async function decompressFile(compressedFileHandle, decompressedFileHandle) {
     writeHandle.close();
 }
 
-// Creates the OPFS file for the incoming guest recording on first write.
-async function ensureGuestFile() {
-    if (!guestFileHandle) {
-        try {
-            const root = await navigator.storage.getDirectory();
-            const fileName = `guest-recording-${Date.now()}.raw`;
-            guestFileHandle = await root.getFileHandle(fileName, { create: true });
-            guestAccessHandle = await guestFileHandle.createSyncAccessHandle();
-        } catch (error) {
-            self.postMessage({ type: 'ERROR', message: 'Failed to access Guest OPFS: ' + error.message });
-        }
+// Creates or returns the OPFS file for a specific guest's incoming recording.
+async function ensureGuestFile(guestId) {
+    if (guestFiles.has(guestId) && guestFiles.get(guestId).accessHandle) {
+        return guestFiles.get(guestId);
+    }
+
+    try {
+        const root = await navigator.storage.getDirectory();
+        const fileName = `guest-${guestId}-${Date.now()}.raw`;
+        const handle = await root.getFileHandle(fileName, { create: true });
+        const access = await handle.createSyncAccessHandle();
+        const entry = { fileHandle: handle, accessHandle: access, fileName };
+        guestFiles.set(guestId, entry);
+        return entry;
+    } catch (error) {
+        self.postMessage({ type: 'ERROR', message: `Failed to access Guest OPFS for ${guestId}: ${error.message}` });
+        return null;
     }
 }
 
-// Creates the OPFS file for the local (host) recording.
+// Creates the OPFS file for the local (host or guest's own) recording.
 async function initFile() {
     try {
         const root = await navigator.storage.getDirectory();
@@ -164,29 +172,34 @@ async function processMessage(msg, ports) {
         workletPort = ports ? ports[0] : null;
         workletPort.onmessage = (event) => handleAudioMessage(event.data);
     }
-    else if (msg.type === 'CLOSING' && accessHandle) {
-        accessHandle.flush();
-        accessHandle.close();
-        accessHandle = null;
-        if (guestAccessHandle) {
-            guestAccessHandle.flush();
-            guestAccessHandle.close();
-            guestAccessHandle = null;
+    else if (msg.type === 'CLOSING') {
+        // Close the local recording file handle.
+        if (accessHandle) {
+            accessHandle.flush();
+            accessHandle.close();
+            accessHandle = null;
+        }
+        // Close all guest file handles.
+        for (const [guestId, entry] of guestFiles) {
+            if (entry.accessHandle) {
+                entry.accessHandle.flush();
+                entry.accessHandle.close();
+                entry.accessHandle = null;
+            }
         }
         self.postMessage({ type: 'FILE_CLOSED' });
     } 
     else if (msg.type === 'WRITE_GUEST_CHUNK') {
-        if (!guestAccessHandle) {
-            await ensureGuestFile();
-        }
-        if (guestAccessHandle) {
-            console.log(`Worker writing Guest Chunk: ${msg.data.byteLength} bytes`);
-            guestAccessHandle.write(new Uint8Array(msg.data));
+        const guestId = msg.guestId;
+        const entry = await ensureGuestFile(guestId);
+        if (entry && entry.accessHandle) {
+            entry.accessHandle.write(new Uint8Array(msg.data));
             // Notify the main thread so it can ACK the guest and trigger the next chunk.
-            self.postMessage({ type: 'ACK_READ' });
+            self.postMessage({ type: 'ACK_READ', guestId });
         }
     }
     else if (msg.type === 'READ_CHUNKS') {
+        // Guest-side: read and send the local recording file in chunks.
         try {
             if (accessHandle) {
                 accessHandle.flush();
@@ -204,6 +217,7 @@ async function processMessage(msg, ports) {
         }
     }
     else if (msg.type === 'ACK_READ') {
+        // Guest-side: host acknowledged receiving the chunk, send the next one.
         try {
             const file = await fileHandle.getFile();
             readNextChunk(file);
@@ -212,6 +226,7 @@ async function processMessage(msg, ports) {
         }
     }
     else if (msg.type === 'COMPRESS_GUEST') {
+        // Guest-side: compress own recording before sending.
         try {
             const root = await navigator.storage.getDirectory();
             const compressedName = `guest-compressed-${Date.now()}.flac`;
@@ -226,21 +241,31 @@ async function processMessage(msg, ports) {
         }
     }
     else if (msg.type === 'DECOMPRESS_GUEST') {
+        // Host-side: decompress a specific guest's received file.
+        const guestId = msg.guestId;
+        const entry = guestFiles.get(guestId);
+        if (!entry) {
+            self.postMessage({ type: 'ERROR', message: `No file found for guest ${guestId}` });
+            return;
+        }
+
         try {
             const root = await navigator.storage.getDirectory();
-            const decompressedName = `guest-decompressed-${Date.now()}.raw`;
+            const decompressedName = `guest-decompressed-${guestId}-${Date.now()}.raw`;
             const decompressedHandle = await root.getFileHandle(decompressedName, { create: true });
             
-            await decompressFile(guestFileHandle, decompressedHandle);
+            await decompressFile(entry.fileHandle, decompressedHandle, guestId);
             
-            guestFileHandle = decompressedHandle;
-            self.postMessage({ type: 'DECOMPRESS_DONE' });
+            // Point the guest entry to the decompressed file for cropping later.
+            entry.fileHandle = decompressedHandle;
+            entry.accessHandle = null;
+            self.postMessage({ type: 'DECOMPRESS_DONE', guestId });
         } catch(e) {
-            self.postMessage({ type: 'ERROR', message: 'Decompression failed: ' + e.message });
+            self.postMessage({ type: 'ERROR', message: `Decompression failed for guest ${guestId}: ${e.message}` });
         }
     }
     else if (msg.type === 'CROP_FILES') {
-        await processSyncCrops(msg.hostCropBytes, msg.guestCropBytes);
+        await processSyncCrops(msg.hostCropBytes, msg.guestCrops);
     }
 }
 
@@ -265,42 +290,57 @@ async function readNextChunk(file) {
     readOffset = limit;
 }
 
-async function processSyncCrops(hostCropBytes, guestCropBytes) {
+// Crop the host file and each guest file to align them after sync calculations.
+// guestCrops is an array of { guestId, cropBytes }.
+async function processSyncCrops(hostCropBytes, guestCrops) {
     try {
         const root = await navigator.storage.getDirectory();
-        
         const timestamp = Date.now();
-        const hostName = `final-host-${timestamp}.raw`;
-        const guestName = `final-guest-${timestamp}.raw`;
 
+        // Crop the host file.
+        const hostName = `final-host-${timestamp}.raw`;
         const finalHostFile = await root.getFileHandle(hostName, { create: true });
         const finalHostAccess = await finalHostFile.createSyncAccessHandle();
-        
-        const finalGuestFile = await root.getFileHandle(guestName, { create: true });
-        const finalGuestAccess = await finalGuestFile.createSyncAccessHandle();
-        
-        // Close any open write handles before attempting to read.
+
+        // Close any lingering write handles before reading.
         if (accessHandle) {
             accessHandle.flush();
             accessHandle.close();
             accessHandle = null;
         }
-        if (guestAccessHandle) {
-            guestAccessHandle.flush();
-            guestAccessHandle.close();
-            guestAccessHandle = null;
-        }
-        
+
         const hostReadFile = await fileHandle.getFile();
-        const guestReadFile = await guestFileHandle.getFile();
-        
         await copyWithCrop(hostReadFile, hostCropBytes, finalHostAccess);
-        await copyWithCrop(guestReadFile, guestCropBytes, finalGuestAccess);
-        
         finalHostAccess.close();
-        finalGuestAccess.close();
-        
-        self.postMessage({ type: 'CROP_DONE', hostFile: hostName, guestFile: guestName });
+
+        // Crop each guest file in sequence (OPFS sync handles can't truly parallelize).
+        const resultFiles = {};
+        for (const cropInfo of guestCrops) {
+            const entry = guestFiles.get(cropInfo.guestId);
+            if (!entry) {
+                console.error(`No file entry for guest ${cropInfo.guestId} during crop`);
+                continue;
+            }
+
+            // Close any open access handle so we can read the file.
+            if (entry.accessHandle) {
+                entry.accessHandle.flush();
+                entry.accessHandle.close();
+                entry.accessHandle = null;
+            }
+
+            const guestName = `final-guest-${cropInfo.guestId.slice(-6)}-${timestamp}.raw`;
+            const finalGuestFile = await root.getFileHandle(guestName, { create: true });
+            const finalGuestAccess = await finalGuestFile.createSyncAccessHandle();
+
+            const guestReadFile = await entry.fileHandle.getFile();
+            await copyWithCrop(guestReadFile, cropInfo.cropBytes, finalGuestAccess);
+            finalGuestAccess.close();
+
+            resultFiles[cropInfo.guestId] = guestName;
+        }
+
+        self.postMessage({ type: 'CROP_DONE', hostFile: hostName, guestFiles: resultFiles });
         
     } catch (e) {
         self.postMessage({ type: 'ERROR', message: 'Failed to crop files: ' + e.message });

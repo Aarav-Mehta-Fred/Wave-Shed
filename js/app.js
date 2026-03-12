@@ -7,6 +7,24 @@ window.app = {
 
     selectedMicId: null,
 
+    // Local participant info
+    localName: '',
+    localHeadphones: false,
+    localSpeaker: '',
+
+    /**
+     * Sets the local participant info before joining a session.
+     * @param {string} name - Display name for this participant.
+     * @param {boolean} headphones - Whether the participant is wearing headphones.
+     * @param {string} speaker - The deviceId of the selected speaker output.
+     */
+    setParticipantInfo: function(name, headphones, speaker) {
+        this.localName = name || '';
+        this.localHeadphones = headphones || false;
+        this.localSpeaker = speaker || '';
+        console.log(`[UI] Participant info set: name="${this.localName}", headphones=${this.localHeadphones}, speaker="${this.localSpeaker}"`);
+    },
+
     /**
      * Requests permission to access the microphone and enumerates available audio devices.
      * @returns {Promise<MediaDeviceInfo[]>} A list of available microphones.
@@ -42,8 +60,41 @@ window.app = {
         this.selectedMicId = deviceId;
     },
 
+    /**
+     * Prompts the host to accept or deny a guest trying to join.
+     * Returns a Promise that resolves to true (admit) or false (deny).
+     * @param {object} guestInfo - Contains name, headphones, speaker, micId.
+     * @returns {Promise<boolean>}
+     */
+    promptAdmission: function(guestInfo) {
+        const name = guestInfo.name || 'Unknown';
+        const headphones = guestInfo.headphones ? 'Yes' : 'No';
+        return Promise.resolve(
+            window.confirm(`"${name}" wants to join.\nHeadphones: ${headphones}\n\nAllow them in?`)
+        );
+    },
+
+    /**
+     * Called when the host denies our join request.
+     */
+    onAdmissionDenied: function() {
+        console.log('[UI] We were denied entry to the meeting.');
+        alert('The host denied your join request.');
+    },
+
     startCountdown: function(seconds) {
         console.log(`[UI] Visual countdown started for ${seconds.toFixed(2)} seconds.`);
+    },
+
+    // Map of guestId -> display name, populated by audio.js when guests are admitted.
+    guestRoster: {},
+
+    /**
+     * Registers a guest's display name so progress bars can label them.
+     * Called from audio.js when a guest is admitted.
+     */
+    registerGuest: function(guestId, name) {
+        this.guestRoster[guestId] = name;
     },
 
     initProgressUI: function() {
@@ -51,16 +102,34 @@ window.app = {
     },
 
     // Throttles logging to 5% increments to avoid flooding the console.
-    updateProgress: function(type, current, total, extraInfo = '') {
+    updateProgress: function(type, current, total, guestId = '') {
         if (total === 0) return;
         const percentage = (current / total) * 100;
         const roundedPercentage = Math.floor(percentage / 5) * 5;
         
-        if (roundedPercentage > this.progressState[type] || percentage === 100) {
-            this.progressState[type] = percentage === 100 ? 100 : roundedPercentage;
-            const displayPct = this.progressState[type];
-            console.log(`[UI] ${type.toUpperCase()} Progress: ${displayPct}% ${extraInfo}`);
+        const key = guestId ? `${type}_${guestId}` : type;
+        if (this.progressState[key] === undefined) {
+            this.progressState[key] = -1;
         }
+
+        if (roundedPercentage > this.progressState[key] || percentage === 100) {
+            this.progressState[key] = percentage === 100 ? 100 : roundedPercentage;
+            const displayPct = this.progressState[key];
+            const guestLabel = guestId ? (this.guestRoster[guestId] || guestId.slice(-6)) : '';
+            const label = guestLabel ? `${type.toUpperCase()} (${guestLabel})` : type.toUpperCase();
+            console.log(`[UI] ${label} Progress: ${displayPct}%`);
+        }
+    },
+
+    /**
+     * Returns the participant info object to pass into initHost/initGuest.
+     */
+    getParticipantInfo: function() {
+        return {
+            name: this.localName,
+            headphones: this.localHeadphones,
+            speaker: this.localSpeaker
+        };
     }
 };
 
@@ -78,7 +147,7 @@ window.addEventListener('DOMContentLoaded', async () => {
     
     if (meetingId && window.AudioSync) {
         console.log('Auto-joining meeting as guest:', meetingId);
-        // Pass the chosen microphone to the audio logic
-        window.AudioSync.initGuest(meetingId, window.app.selectedMicId);
+        // Pass the chosen microphone and participant info to the audio logic
+        window.AudioSync.initGuest(meetingId, window.app.selectedMicId, window.app.getParticipantInfo());
     }
 });
