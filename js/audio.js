@@ -6,9 +6,12 @@ let audioWorker = null;
 let mediaStream = null;
 let commsStream = null; // Separate processed stream for live voice comms
 let pcmProcessor = null;
+let mediaStreamSource = null;
 
 let isHost = false;
 let peerId = null;
+let isRecording = false;
+let isMuted = false;
 
 // Local participant info (set by app.js before calling init).
 let localName = '';
@@ -21,6 +24,7 @@ let localSampleRate = 44100;
 let hostCountdownStart = 0;
 let hostRecordingStart = 0;
 let guestRecordingStart = 0;
+let lateJoinTime = 0; // Host-clock time when a late guest joined
 
 // Per-guest state maps (keyed by guest peerId)
 let guests = new Map();             // guestId -> { name, headphones, speaker, micId, dataChannel, calls: [] }
@@ -34,6 +38,7 @@ let guestExpectedSizes = new Map(); // guestId -> expected file size
 let guestReceivedBytes = new Map(); // guestId -> bytes received so far
 
 let currentTestId = 0;
+let liveCommsPlayers = new Map(); // label -> Audio element
 
 // Guest-side: the data channel back to the host (there's only one).
 let hostDataChannel = null;
@@ -44,6 +49,7 @@ let guestVoiceCalls = [];
 let pendingDecompressions = 0;
 let pendingTransfers = 0;
 let totalGuests = 0;
+let endMeetingAfterCrop = false;
 
 // ==========================================
 // Phase 1 - Setup & Audio Routing
@@ -117,8 +123,11 @@ async function setupAudioPipeline(selectedMicId = null) {
     pcmProcessor.port.postMessage({ type: 'INIT_PORT' }, [channel.port1]);
     audioWorker.postMessage({ type: 'INIT_PORT' }, [channel.port2]);
 
-    const source = audioContext.createMediaStreamSource(mediaStream);
-    source.connect(pcmProcessor);
+    if (mediaStreamSource) {
+        mediaStreamSource.disconnect();
+    }
+    mediaStreamSource = audioContext.createMediaStreamSource(mediaStream);
+    mediaStreamSource.connect(pcmProcessor);
     // Output is intentionally left disconnected - we don't want local monitoring.
     // The pcmProcessor acts as a sink; it must return true in process() to stay alive.
 }
@@ -135,13 +144,13 @@ const PEER_CONFIG = {
 const MAX_PEER_RETRIES = 5;
 const PEER_RETRY_DELAY_MS = 5000;
 
-function createPeerWithRetry(onOpen, onError) {
+function createPeerWithRetry(onOpen, onError, preferredId = null) {
     let attempt = 0;
 
     function tryConnect() {
         attempt++;
         console.log(`[PeerJS] Connection attempt ${attempt}/${MAX_PEER_RETRIES}...`);
-        const p = new Peer(PEER_CONFIG);
+        const p = preferredId ? new Peer(preferredId, PEER_CONFIG) : new Peer(PEER_CONFIG);
 
         p.on('open', (id) => {
             console.log(`[PeerJS] Connected on attempt ${attempt}`);
@@ -157,6 +166,11 @@ function createPeerWithRetry(onOpen, onError) {
                 console.warn(`[PeerJS] Attempt ${attempt} failed (${err.type}), retrying in ${PEER_RETRY_DELAY_MS}ms...`);
                 p.destroy();
                 setTimeout(tryConnect, PEER_RETRY_DELAY_MS);
+            } else if (err.type === 'unavailable-id' && preferredId) {
+                console.warn(`[PeerJS] Preferred ID "${preferredId}" is unavailable. Retrying with random ID...`);
+                p.destroy();
+                preferredId = null; // Reset and retry once
+                setTimeout(tryConnect, 500); 
             } else {
                 console.error(`[PeerJS] Failed after ${attempt} attempt(s):`, err);
                 if (onError) onError(err);
@@ -169,63 +183,54 @@ function createPeerWithRetry(onOpen, onError) {
     return tryConnect();
 }
 
-function initHost(selectedMicId = null, participantInfo = {}) {
+function initHost(selectedMicId = null, participantInfo = {}, existingMeetingId = null) {
     isHost = true;
     localName = participantInfo.name || 'Host';
     localHeadphones = participantInfo.headphones || false;
     localSpeaker = participantInfo.speaker || '';
 
-    createPeerWithRetry((p, id) => {
+    createPeerWithRetry(async (p, id) => {
+        await setupAudioPipeline(selectedMicId);
+        
         peer = p;
         peerId = id;
         console.log('Host Room ID:', id);
+
+        if (window.WakeLock) window.WakeLock.acquire();
+        if (window.app && window.app.setSessionState) window.app.setSessionState('in_meeting');
         
+        // Save session for reconnection
+        localStorage.setItem('waveshed_session', JSON.stringify({
+            role: 'host',
+            meetingId: id
+        }));
+
         const url = new URL(window.location.href);
         url.searchParams.set('meeting', id);
         window.history.replaceState({}, '', url);
         
-        const copyToClipboard = async (text) => {
-            try {
-                if (navigator.clipboard) {
-                    await navigator.clipboard.writeText(text);
-                    console.log('Meeting URL copied to clipboard:', text);
-                    return;
-                }
-            } catch (err) {
-                console.error('Failed native clipboard copy:', err);
-            }
-            
-            // Fallback for when the document is not focused or writeText is blocked.
-            const textArea = document.createElement("textarea");
-            textArea.value = text;
-            textArea.style.position = "fixed";
-            textArea.style.top = "0";
-            textArea.style.left = "0";
-            document.body.appendChild(textArea);
-            textArea.focus();
-            textArea.select();
-            try {
-                const successful = document.execCommand('copy');
-                console.log('Fallback clipboard copy:', successful ? 'successful' : 'unsuccessful');
-            } catch (err) {
-                console.error('Fallback clipboard copy failed:', err);
-            }
-            document.body.removeChild(textArea);
-        };
-
-        copyToClipboard(url.toString());
+        console.log('[Host] Meeting URL:', url.toString());
 
         // When a guest opens a data channel connection to us.
         peer.on('connection', (conn) => {
             const guestInfo = conn.metadata || {};
             const guestId = conn.peer;
+            const isReconnect = guestInfo.reconnect === true;
 
-            console.log(`[Host] Guest "${guestInfo.name || 'Unknown'}" (${guestId}) requesting to join`);
+            console.log(`[Host] Guest "${guestInfo.name || 'Unknown'}" (${guestId}) requesting to join ${isReconnect ? '(Reconnect)' : ''}`);
 
             // Prompt the host to accept or deny the guest.
             const admitGuest = async () => {
                 let admitted = true;
-                if (window.app && window.app.promptAdmission) {
+                
+                // Auto-admit if it's a reconnect and the guest was previously known.
+                // We should also store admitted guests in localStorage to survive host reloads.
+                const previouslyAdmitted = JSON.parse(localStorage.getItem('waveshed_admitted_guests') || '[]');
+                
+                if (isReconnect && previouslyAdmitted.includes(guestId)) {
+                    console.log(`[Host] Auto-admitting reconnecting guest: ${guestId}`);
+                    admitted = true;
+                } else if (window.app && window.app.promptAdmission) {
                     admitted = await window.app.promptAdmission(guestInfo);
                 }
 
@@ -258,6 +263,12 @@ function initHost(selectedMicId = null, participantInfo = {}) {
                     dataChannel: conn
                 });
 
+                // Update admitted guests list for persistence
+                if (!previouslyAdmitted.includes(guestId)) {
+                    previouslyAdmitted.push(guestId);
+                    localStorage.setItem('waveshed_admitted_guests', JSON.stringify(previouslyAdmitted));
+                }
+
                 // Initialize per-guest telemetry storage.
                 guestNetworkTests.set(guestId, []);
                 guestTestTimestamps.set(guestId, {});
@@ -275,8 +286,17 @@ function initHost(selectedMicId = null, participantInfo = {}) {
                     conn.send(JSON.stringify({
                         type: 'ADMISSION_ACCEPTED',
                         roster: roster,
-                        hostName: localName
+                        hostName: localName,
+                        hostId: peerId
                     }));
+
+                    if (isRecording) {
+                        conn.send(JSON.stringify({ 
+                            type: 'RECORDING_IN_PROGRESS',
+                            hostTime: audioContext.currentTime,
+                            hostCountdownStart: hostCountdownStart
+                        }));
+                    }
 
                     // Tell all existing guests about the newcomer so they can set up voice.
                     const newGuestInfo = {
@@ -302,14 +322,19 @@ function initHost(selectedMicId = null, participantInfo = {}) {
                 console.warn(`[Host] Ignoring call from unknown peer: ${callerId}`);
                 return;
             }
-            if (!commsStream) await setupAudioPipeline(selectedMicId);
             call.answer(commsStream);
             call.on('stream', (stream) => playLiveComms(stream, callerId));
+            
+            const guest = guests.get(callerId);
+            if (guest) {
+                if (!guest.calls) guest.calls = [];
+                guest.calls.push(call);
+            }
         });
-    });
+    }, null, existingMeetingId);
 }
 
-async function initGuest(roomId, selectedMicId = null, participantInfo = {}) {
+async function initGuest(roomId, selectedMicId = null, participantInfo = {}, isReconnect = false, preferredGuestId = null) {
     isHost = false;
     localName = participantInfo.name || 'Guest';
     localHeadphones = participantInfo.headphones || false;
@@ -321,6 +346,9 @@ async function initGuest(roomId, selectedMicId = null, participantInfo = {}) {
         console.log('Guest Connected ID:', id);
 
         await setupAudioPipeline(selectedMicId);
+        
+        if (window.WakeLock) window.WakeLock.acquire();
+        if (window.app && window.app.setSessionState) window.app.setSessionState('in_meeting');
 
         // Connect to the host with our info as metadata.
         hostDataChannel = peer.connect(roomId, {
@@ -329,30 +357,46 @@ async function initGuest(roomId, selectedMicId = null, participantInfo = {}) {
                 name: localName,
                 headphones: localHeadphones,
                 speaker: localSpeaker,
-                micId: selectedMicId
+                micId: selectedMicId,
+                reconnect: isReconnect
             }
         });
         setupHostDataChannel(hostDataChannel);
 
         // Call the host for live voice comms.
-        const call = peer.call(roomId, commsStream);
-        call.on('stream', (stream) => playLiveComms(stream, 'host'));
+        const hostCall = peer.call(roomId, commsStream);
+        hostCall.on('stream', (stream) => playLiveComms(stream, 'host'));
+        guestVoiceCalls.push(hostCall);
 
         // Other guests might call us for voice once the host tells them about us.
         peer.on('call', async (incomingCall) => {
-            if (!commsStream) await setupAudioPipeline(selectedMicId);
             incomingCall.answer(commsStream);
             incomingCall.on('stream', (stream) => playLiveComms(stream, incomingCall.peer));
             guestVoiceCalls.push(incomingCall);
         });
-    });
+    }, null, preferredGuestId);
 }
 
 function playLiveComms(stream, label) {
-    const audio = new Audio();
+    let audio = liveCommsPlayers.get(label);
+    if (!audio) {
+        audio = new Audio();
+        liveCommsPlayers.set(label, audio);
+        console.log(`[Voice] Created new Audio element for: ${label}`);
+    }
     audio.srcObject = stream;
-    audio.play();
+    audio.play().catch(e => console.warn('[Voice] Autoplay blocked:', e));
     console.log(`[Voice] Playing live comms from: ${label}`);
+}
+
+function stopLiveComms(label) {
+    const audio = liveCommsPlayers.get(label);
+    if (audio) {
+        audio.pause();
+        audio.srcObject = null;
+        liveCommsPlayers.delete(label);
+        console.log(`[Voice] Stopped and cleaned up live comms for: ${label}`);
+    }
 }
 
 // ==========================================
@@ -361,6 +405,15 @@ function playLiveComms(stream, label) {
 
 // Host-side: set up listeners on a specific guest's data channel.
 function setupGuestDataChannel(guestId, conn) {
+    conn.on('close', () => {
+        console.log(`[Host] Data channel closed for guest: ${guestId}`);
+        const guest = guests.get(guestId);
+        const name = guest ? guest.name : guestId.slice(-6);
+        stopLiveComms(guestId);
+        guests.delete(guestId);
+        broadcastToGuests({ type: 'PARTICIPANT_LEFT', name, peerId: guestId });
+        if (window.app && window.app.onParticipantLeft) window.app.onParticipantLeft(name);
+    });
     conn.on('data', async (data) => {
         let currentChunkSize = 0;
 
@@ -403,6 +456,11 @@ function setupGuestDataChannel(guestId, conn) {
 function setupHostDataChannel(conn) {
     conn.on('open', () => {
         console.log('[Guest] Data channel to host is open');
+    });
+
+    conn.on('close', () => {
+        console.log('[Guest] Data channel to host closed');
+        stopLiveComms('host');
     });
 
     conn.on('data', async (data) => {
@@ -479,12 +537,12 @@ function handleWorkerMessage(e) {
             console.log(`Guest Sending Chunk: ${msg.data.byteLength} bytes`);
             hostDataChannel.send(msg.data);
             
-            const expected = guestExpectedSizes.get(peerId) || expectedFileSize || 0;
+            const expected = expectedFileSize || 0;
             if (window.app && window.app.updateProgress && expected > 0) {
                 window.app.updateProgress('transferring', msg.offset, expected);
             }
+            if (msg.isLast) finalizeGuestExtraction();
         }
-        if (msg.isLast) finalizeGuestExtraction();
     } else if (msg.type === 'EXTRACT_START') {
         // Guest-side: tell the host how big the file is.
         expectedFileSize = msg.fileSize;
@@ -506,11 +564,29 @@ function handleWorkerMessage(e) {
             const guestSR = telemetry ? (telemetry.guestSampleRate || localSampleRate) : localSampleRate;
             downloadAsWav(fileName, guestSR);
         }
+
+        if (endMeetingAfterCrop) {
+            broadcastToGuests({ type: 'MEETING_ENDED' });
+            if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+            if (commsStream) commsStream.getTracks().forEach(t => t.stop());
+            if (audioWorker) audioWorker.terminate();
+            if (peer) peer.destroy();
+            localStorage.removeItem('waveshed_session');
+            localStorage.removeItem('waveshed_admitted_guests');
+            if (window.WakeLock) window.WakeLock.release();
+            if (window.app && window.app.setSessionState) window.app.setSessionState('idle');
+            endMeetingAfterCrop = false;
+        }
     } else if (msg.type === 'FILE_CLOSED') {
         if (!isHost) {
             // Guest file is finalized, safe to begin extraction.
             extractGuestData();
+        } else if (guests.size === 0) {
+            // Solo recording: no guests, go straight to cropping.
+            runSyncAndPostProcessing();
         }
+    } else if (msg.type === 'TELEMETRY_EXTRAS') {
+        sendTelemetry({ muteLog: msg.muteLog });
     }
 }
 
@@ -554,17 +630,10 @@ async function downloadAsWav(fileName, sampleRate) {
         
         const blob = new Blob([headerBuffer, file], { type: 'audio/wav' });
         const objectUrl = URL.createObjectURL(blob);
-        const anchor = document.createElement('a');
-        anchor.style.display = 'none';
-        anchor.href = objectUrl;
-        anchor.download = fileName.replace('.raw', '.wav');
-        document.body.appendChild(anchor);
-        anchor.click();
+        console.log(`[Download] WAV ready: ${fileName.replace('.raw', '.wav')} | URL: ${objectUrl}`);
+        URL.revokeObjectURL(objectUrl);
         
-        setTimeout(() => {
-            document.body.removeChild(anchor);
-            URL.revokeObjectURL(objectUrl);
-        }, 100);
+        // TODO: Replace with anchor.click() when UI exists.
     } catch (error) {
         console.error('Error creating WAV file:', fileName, error);
     }
@@ -671,6 +740,31 @@ function handleHostDataMessage(guestId, msg) {
             }
             break;
         }
+
+        case 'GUEST_LEAVING': {
+            console.log(`[Host] Guest leaving: ${msg.name} (${guestId})`);
+            stopLiveComms(guestId);
+            guests.delete(guestId);
+            // Notify others
+            broadcastToGuests({ type: 'PARTICIPANT_LEFT', name: msg.name, peerId: guestId }, guestId);
+            if (window.app && window.app.onParticipantLeft) {
+                window.app.onParticipantLeft(msg.name);
+            }
+            break;
+        }
+
+        case 'MUTE_STATE_CHANGE': {
+            const guest = guests.get(guestId);
+            if (guest) {
+                guest.isMuted = msg.isMuted;
+            }
+            // Relay to others
+            broadcastToGuests({ type: 'MUTE_STATE_CHANGE', peerId: guestId, isMuted: msg.isMuted }, guestId);
+            if (window.app && window.app.onMuteStateChanged) {
+                window.app.onMuteStateChanged(guestId, msg.isMuted);
+            }
+            break;
+        }
     }
 }
 
@@ -685,11 +779,24 @@ function handleGuestDataMessage(msg) {
     switch (msg.type) {
         case 'ADMISSION_ACCEPTED': {
             console.log(`[Guest] Admitted to meeting. Host: ${msg.hostName}. Roster: ${msg.roster.length} other guest(s).`);
+            
+            // Save session info
+            localStorage.setItem('waveshed_session', JSON.stringify({
+                role: 'guest',
+                hostId: msg.hostId,
+                guestPeerId: peer.id,
+                participantInfo: {
+                    name: localName,
+                    headphones: localHeadphones,
+                    speaker: localSpeaker
+                }
+            }));
+
             // Call each existing guest for direct voice.
             for (const existing of msg.roster) {
                 console.log(`[Guest] Calling existing guest "${existing.name}" (${existing.peerId.slice(-6)}) for voice`);
-                const call = peer.call(existing.peerId, mediaStream);
-                call.on('stream', (stream) => playLiveComms(stream, existing.name));
+                const call = peer.call(existing.peerId, commsStream);
+                call.on('stream', (stream) => playLiveComms(stream, existing.peerId));
                 guestVoiceCalls.push(call);
             }
             break;
@@ -697,6 +804,11 @@ function handleGuestDataMessage(msg) {
 
         case 'ADMISSION_DENIED': {
             console.log('[Guest] Host denied our join request.');
+            if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+            if (commsStream) commsStream.getTracks().forEach(t => t.stop());
+            if (audioWorker) setTimeout(() => audioWorker.terminate(), 100);
+            if (peer) peer.destroy();
+            if (window.WakeLock) window.WakeLock.release();
             if (window.app && window.app.onAdmissionDenied) {
                 window.app.onAdmissionDenied();
             }
@@ -761,6 +873,61 @@ function handleGuestDataMessage(msg) {
             audioWorker.postMessage({ type: 'CLOSING' });
             break;
         }
+
+        case 'PARTICIPANT_LEFT': {
+            console.log(`[Guest] Participant left: ${msg.name}`);
+            stopLiveComms(msg.peerId);
+            if (window.app && window.app.onParticipantLeft) {
+                window.app.onParticipantLeft(msg.name);
+            }
+            break;
+        }
+
+        case 'MEETING_ENDED': {
+            console.log('[Guest] Meeting ended by host');
+
+            // Clear all live comms players
+            for (const label of [...liveCommsPlayers.keys()]) {
+                stopLiveComms(label);
+            }
+
+            if (isRecording && pcmProcessor) {
+                pcmProcessor.port.postMessage({ command: 'stop_recording' });
+            }
+            if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+            if (commsStream) commsStream.getTracks().forEach(t => t.stop());
+            if (audioWorker) audioWorker.terminate();
+            localStorage.removeItem('waveshed_session');
+            if (window.app && window.app.onMeetingEnded) {
+                window.app.onMeetingEnded();
+            }
+            // Cleanup connections
+            if (peer) peer.destroy();
+            if (window.WakeLock) window.WakeLock.release();
+            break;
+        }
+
+        case 'MUTE_STATE_CHANGE': {
+            if (window.app && window.app.onMuteStateChanged) {
+                window.app.onMuteStateChanged(msg.peerId, msg.isMuted);
+            }
+            break;
+        }
+
+        case 'RECORDING_IN_PROGRESS': {
+            if (!isRecording) {
+                console.log('[Guest] Late join: recording is already in progress. Starting now.');
+                isRecording = true;
+                hostCountdownStart = msg.hostCountdownStart; // use host's value
+                lateJoinTime = audioContext.currentTime;
+                if (audioContext && audioContext.state === 'suspended') {
+                    audioContext.resume();
+                }
+                pcmProcessor.port.postMessage({ command: 'start_recording' });
+                if (window.app && window.app.setSessionState) window.app.setSessionState('recording');
+            }
+            break;
+        }
     }
 }
 
@@ -784,18 +951,29 @@ async function startRecordingProcess() {
         timestamps[currentTestId] = { T0: audioContext.currentTime };
         guestTestTimestamps.set(guestId, timestamps);
 
-        // Create a promise that resolves when the INITIAL_PONG comes back.
+        // Create a promise that resolves when the INITIAL_PONG comes back or times out.
         await new Promise((resolve) => {
-            pendingInitialPongResolve = resolve;
+            const timeout = setTimeout(() => {
+                console.warn(`[Host] No INITIAL_PONG from ${guestId.slice(-6)} after 5s, skipping.`);
+                pendingInitialPongResolve = null;
+                resolve();
+            }, 5000);
+
+            pendingInitialPongResolve = (id) => {
+                clearTimeout(timeout);
+                resolve();
+            };
             sendToGuest(guestId, { type: 'INITIAL_PING', testId: currentTestId });
         });
     }
 
     // Step 2: Record the countdown start time and fire countdowns everywhere.
     hostCountdownStart = audioContext.currentTime;
+    isRecording = true;
     if (window.app && window.app.startCountdown) {
         window.app.startCountdown(5);
     }
+    if (window.app && window.app.setSessionState) window.app.setSessionState('recording');
 
     // Send START_RECORDING_CMD to each guest, offset by their individual half-RTT.
     for (const guestId of guestIds) {
@@ -809,8 +987,8 @@ async function startRecordingProcess() {
         const targetId = guestIds[testIndex % guestIds.length];
         runNetworkTest(targetId);
         testIndex++;
-    }, 150);
-    setTimeout(() => clearInterval(testInterval), 3000);
+    }, 80);
+    setTimeout(() => clearInterval(testInterval), 4000);
 
     // Step 4: Trigger host recording at 4.5s into the countdown.
     setTimeout(() => {
@@ -822,10 +1000,11 @@ async function startRecordingProcess() {
 // Called from the UI to end the recording and begin extraction from all guests.
 function stopRecordingProcess() {
     if (!isHost) return;
-    audioWorker.postMessage({ type: 'CLOSING' });
     pcmProcessor.port.postMessage({ command: 'stop_recording' });
+    isRecording = false;
 
     const stopTime = audioContext.currentTime;
+    if (window.app && window.app.setSessionState) window.app.setSessionState('transferring');
     pendingStopPongs = guests.size;
     pendingTransfers = guests.size;
 
@@ -835,6 +1014,10 @@ function stopRecordingProcess() {
         guestStopHandshakes.set(guestId, handshake);
         sendToGuest(guestId, { type: 'STOP_PING' });
     }
+
+
+    // Give the worklet time to finish flushing, then close the host file.
+    setTimeout(() => audioWorker.postMessage({ type: 'CLOSING' }), 50);
 }
 
 // ==========================================
@@ -847,10 +1030,21 @@ function extractGuestData() {
 }
 
 function finalizeGuestExtraction() {
+    if (audioWorker) {
+        audioWorker.postMessage({ type: 'GET_TELEMETRY_EXTRAS' });
+    } else {
+        sendTelemetry({});
+    }
+}
+
+function sendTelemetry(extras) {
     const telemetry = {
         guestRecordingStart: guestRecordingStart,
         guestSampleRate: localSampleRate,
-        guestInputLatency: localInputLatency
+        guestInputLatency: localInputLatency,
+        isLateJoin: lateJoinTime > 0,
+        lateJoinTime: lateJoinTime,
+        ...extras
     };
     sendToHost({ type: 'TELEMETRY_DATA', payload: telemetry });
 }
@@ -941,5 +1135,167 @@ window.AudioSync = {
     initHost,
     initGuest,
     startRecordingProcess,
-    stopRecordingProcess
+    stopRecordingProcess,
+    switchMicrophone,
+    leaveSession,
+    endMeeting,
+    setMuted
 };
+
+// --- New Feature Functions ---
+
+async function switchMicrophone(newDeviceId) {
+    if (isRecording) {
+        throw new Error("Cannot switch microphone during recording.");
+    }
+
+    console.log(`[Audio Pipeline] Switching microphone to: ${newDeviceId}`);
+
+    // Stop current tracks
+    if (mediaStream) {
+        mediaStream.getTracks().forEach(t => t.stop());
+    }
+    if (commsStream) {
+        commsStream.getTracks().forEach(t => t.stop());
+    }
+
+    // Re-open streams
+    const recordingConstraints = {
+        audio: {
+            deviceId: { exact: newDeviceId },
+            echoCancellation: false,
+            autoGainControl: false,
+            noiseSuppression: false
+        }
+    };
+    const commsConstraints = {
+        audio: {
+            deviceId: { exact: newDeviceId },
+            echoCancellation: !localHeadphones,
+            autoGainControl: true,
+            noiseSuppression: true
+        }
+    };
+
+    mediaStream = await navigator.mediaDevices.getUserMedia(recordingConstraints);
+    commsStream = await navigator.mediaDevices.getUserMedia(commsConstraints);
+
+    // Update latencies
+    const trackSettings = mediaStream.getAudioTracks()[0].getSettings();
+    const trackLatency = trackSettings.latency || 0;
+    const baseLatency = audioContext.baseLatency || 0;
+    localInputLatency = trackLatency + baseLatency;
+
+    // Update PCM processor connection
+    if (pcmProcessor) {
+        if (mediaStreamSource) {
+            mediaStreamSource.disconnect();
+        }
+        mediaStreamSource = audioContext.createMediaStreamSource(mediaStream);
+        mediaStreamSource.connect(pcmProcessor);
+    }
+
+    // Replace tracks in active calls
+    const newCommsTrack = commsStream.getAudioTracks()[0];
+    
+    if (isHost) {
+        for (const guest of guests.values()) {
+            if (guest.calls) {
+                guest.calls.forEach(call => {
+                    const sender = call.peerConnection.getSenders().find(s => s.track && s.track.kind === 'audio');
+                    if (sender) sender.replaceTrack(newCommsTrack);
+                });
+            }
+        }
+    } else {
+        // Guest calls
+        guestVoiceCalls.forEach(call => {
+            const sender = call.peerConnection.getSenders().find(s => s.track && s.track.kind === 'audio');
+            if (sender) sender.replaceTrack(newCommsTrack);
+        });
+    }
+
+    console.log('[Audio Pipeline] Microphone hotswapped successfully.');
+}
+
+async function leaveSession() {
+    console.log('[AudioSync] Leaving session...');
+    
+    // Clear all live comms players
+    for (const label of [...liveCommsPlayers.keys()]) {
+        stopLiveComms(label);
+    }
+
+    if (hostDataChannel && hostDataChannel.open) {
+        sendToHost({ type: 'GUEST_LEAVING', peerId: peerId, name: localName });
+    }
+    if (isRecording && pcmProcessor) {
+        pcmProcessor.port.postMessage({ command: 'stop_recording' });
+    }
+    if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+    if (commsStream) commsStream.getTracks().forEach(t => t.stop());
+    if (audioWorker) audioWorker.terminate();
+    if (peer) peer.destroy();
+    localStorage.removeItem('waveshed_session');
+    if (window.WakeLock) window.WakeLock.release();
+    if (window.app && window.app.setSessionState) window.app.setSessionState('idle');
+}
+
+async function endMeeting() {
+    if (!isHost) return;
+    console.log('[AudioSync] Ending meeting for all participants...');
+
+    if (isRecording || (window.app && window.app.sessionState === 'transferring')) {
+        console.log('[AudioSync] Session active, will end after processing completion.');
+        endMeetingAfterCrop = true;
+        if (isRecording) {
+            stopRecordingProcess();
+        }
+        return;
+    }
+
+    broadcastToGuests({ type: 'MEETING_ENDED' });
+    
+    // Clear live comms
+    for (const label of [...liveCommsPlayers.keys()]) {
+        stopLiveComms(label);
+    }
+
+    // Cleanup
+    if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+    if (commsStream) commsStream.getTracks().forEach(t => t.stop());
+    if (audioWorker) audioWorker.terminate();
+    if (peer) peer.destroy();
+    localStorage.removeItem('waveshed_session');
+    localStorage.removeItem('waveshed_admitted_guests');
+    if (window.WakeLock) window.WakeLock.release();
+    if (window.app && window.app.setSessionState) window.app.setSessionState('idle');
+}
+
+function setMuted(muted) {
+    isMuted = muted;
+    if (commsStream) {
+        commsStream.getAudioTracks().forEach(t => t.enabled = !muted);
+    }
+
+    // Notify others
+    const msg = { type: 'MUTE_STATE_CHANGE', isMuted: muted, peerId: peerId };
+    if (isHost) {
+        broadcastToGuests(msg);
+    } else {
+        sendToHost(msg);
+    }
+
+    // Log mute event in worker for sync preservation
+    if (audioWorker) {
+        audioWorker.postMessage({
+            type: 'MUTE_EVENT',
+            action: muted ? 'mute' : 'unmute',
+            audioTime: audioContext.currentTime
+        });
+    }
+
+    if (window.app && window.app.onMuteStateChanged) {
+        window.app.onMuteStateChanged(peerId, muted);
+    }
+}

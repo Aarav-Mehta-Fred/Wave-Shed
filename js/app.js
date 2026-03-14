@@ -5,6 +5,7 @@ window.app = {
         uncompressing: -1
     },
 
+    sessionState: 'idle', // 'idle' | 'in_meeting' | 'recording' | 'transferring'
     selectedMicId: null,
 
     // Local participant info
@@ -55,9 +56,20 @@ window.app = {
      * Sets the chosen microphone to be used during the session.
      * @param {string} deviceId - The device ID of the selected microphone.
      */
-    setMicrophone: function(deviceId) {
+    setMicrophone: async function(deviceId) {
         console.log(`[UI] Microphone selected: ${deviceId}`);
+        const oldId = this.selectedMicId;
         this.selectedMicId = deviceId;
+
+        // If we're already in a meeting, hot-swap the mic
+        if (window.AudioSync && this.sessionState !== 'idle') {
+            try {
+                await window.AudioSync.switchMicrophone(deviceId);
+            } catch (err) {
+                console.error('[UI] Could not switch microphone:', err.message);
+                this.selectedMicId = oldId; // Revert
+            }
+        }
     },
 
     /**
@@ -69,9 +81,8 @@ window.app = {
     promptAdmission: function(guestInfo) {
         const name = guestInfo.name || 'Unknown';
         const headphones = guestInfo.headphones ? 'Yes' : 'No';
-        return Promise.resolve(
-            window.confirm(`"${name}" wants to join.\nHeadphones: ${headphones}\n\nAllow them in?`)
-        );
+        console.log(`[UI] Admission request from "${name}" (headphones: ${headphones}). Auto-admitting until UI is ready.`);
+        return Promise.resolve(true);
     },
 
     /**
@@ -79,7 +90,6 @@ window.app = {
      */
     onAdmissionDenied: function() {
         console.log('[UI] We were denied entry to the meeting.');
-        alert('The host denied your join request.');
     },
 
     startCountdown: function(seconds) {
@@ -130,8 +140,42 @@ window.app = {
             headphones: this.localHeadphones,
             speaker: this.localSpeaker
         };
+    },
+
+    setSessionState: function(state) {
+        console.log(`[UI] Session state changed: ${this.sessionState} -> ${state}`);
+        this.sessionState = state;
+    },
+
+    onParticipantLeft: function(name) {
+        console.log(`[UI] Notification: ${name} has left the session.`);
+        // In a real UI, this would show a toast/banner
+    },
+
+    onMeetingEnded: function() {
+        console.log('[UI] The host has ended the session.');
+        // Disable controls or redirect
+        this.setSessionState('idle');
+    },
+
+    onMuteStateChanged: function(peerId, isMuted) {
+        console.log(`[UI] Participant ${peerId} is now ${isMuted ? 'muted' : 'unmuted'}.`);
+        // Update roster UI indicator
     }
 };
+
+// --- Lifecycle & Reconnection Logic ---
+
+window.addEventListener('beforeunload', (e) => {
+    const blocking = ['in_meeting', 'recording', 'transferring'];
+    if (blocking.includes(window.app.sessionState)) {
+        // Write dirty exit flag for host/guests who might want to reconnect
+        localStorage.setItem('waveshed_dirty_exit', 'true');
+        
+        e.preventDefault();
+        e.returnValue = ''; // Standard way to trigger "Leave site?" dialog
+    }
+});
 
 window.addEventListener('DOMContentLoaded', async () => {
     // Request permissions and fetch available microphones as soon as the UI loads
@@ -143,11 +187,41 @@ window.addEventListener('DOMContentLoaded', async () => {
     }
 
     const params = new URLSearchParams(window.location.search);
-    const meetingId = params.get('meeting');
+    const meetingIdParam = params.get('meeting');
     
-    if (meetingId && window.AudioSync) {
-        console.log('Auto-joining meeting as guest:', meetingId);
-        // Pass the chosen microphone and participant info to the audio logic
-        window.AudioSync.initGuest(meetingId, window.app.selectedMicId, window.app.getParticipantInfo());
+    // Recovery / Reconnection Flow
+    const savedSession = JSON.parse(localStorage.getItem('waveshed_session') || 'null');
+    const dirtyExit = localStorage.getItem('waveshed_dirty_exit') === 'true';
+    localStorage.removeItem('waveshed_dirty_exit'); // Clear flag
+
+    if (window.AudioSync) {
+        if (meetingIdParam) {
+            console.log('Joining meeting via URL parameter:', meetingIdParam);
+            
+            // If we have a saved session for this meeting, try to use the same Peer ID
+            let preferredId = null;
+            let isReconnect = false;
+            
+            if (savedSession && savedSession.role === 'guest' && savedSession.hostId === meetingIdParam) {
+                preferredId = savedSession.guestPeerId;
+                isReconnect = dirtyExit;
+                console.log(`[App] Attempting reconnection with preferred ID: ${preferredId}`);
+            }
+
+            window.AudioSync.initGuest(
+                meetingIdParam, 
+                window.app.selectedMicId, 
+                window.app.getParticipantInfo(),
+                isReconnect,
+                preferredId
+            );
+        } else if (savedSession && savedSession.role === 'host' && dirtyExit) {
+            console.log('[App] Host dirty exit detected, attempting to recover session:', savedSession.meetingId);
+            window.AudioSync.initHost(
+                window.app.selectedMicId, 
+                window.app.getParticipantInfo(),
+                savedSession.meetingId
+            );
+        }
     }
 });

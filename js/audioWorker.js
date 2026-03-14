@@ -19,8 +19,7 @@ let readOffset = 0;
 let extractFileSize = 0;
 const CHUNK_SIZE = 16 * 1024;
 
-// Track which guest we're currently reading chunks from during extraction.
-let activeReadGuestId = null;
+let muteLog = [];
 
 // Polls until libFLAC is fully initialized and ready to use.
 async function waitFlac() {
@@ -138,6 +137,7 @@ async function ensureGuestFile(guestId) {
 
 // Creates the OPFS file for the local (host or guest's own) recording.
 async function initFile() {
+    muteLog = []; // Reset for new recording session
     try {
         const root = await navigator.storage.getDirectory();
         const fileName = `recording-${Date.now()}.raw`;
@@ -173,19 +173,11 @@ async function processMessage(msg, ports) {
         workletPort.onmessage = (event) => handleAudioMessage(event.data);
     }
     else if (msg.type === 'CLOSING') {
-        // Close the local recording file handle.
+        // Only close the host/guest's OWN local recording file.
         if (accessHandle) {
             accessHandle.flush();
             accessHandle.close();
             accessHandle = null;
-        }
-        // Close all guest file handles.
-        for (const [guestId, entry] of guestFiles) {
-            if (entry.accessHandle) {
-                entry.accessHandle.flush();
-                entry.accessHandle.close();
-                entry.accessHandle = null;
-            }
         }
         self.postMessage({ type: 'FILE_CLOSED' });
     } 
@@ -266,6 +258,16 @@ async function processMessage(msg, ports) {
     }
     else if (msg.type === 'CROP_FILES') {
         await processSyncCrops(msg.hostCropBytes, msg.guestCrops);
+    }
+    else if (msg.type === 'MUTE_EVENT') {
+        muteLog.push({
+            action: msg.action,
+            audioTime: msg.audioTime,
+            wallTime: Date.now()
+        });
+    }
+    else if (msg.type === 'GET_TELEMETRY_EXTRAS') {
+        self.postMessage({ type: 'TELEMETRY_EXTRAS', muteLog: muteLog });
     }
 }
 

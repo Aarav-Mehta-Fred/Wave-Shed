@@ -2,7 +2,6 @@ class PCMProcessor extends AudioWorkletProcessor {
     constructor(options) {
         super();
         this.workerPort = null;
-        this.expectedBlockDuration = 128 / sampleRate;
         this.isRecording = false;
         this.firstFrameReported = false;
 
