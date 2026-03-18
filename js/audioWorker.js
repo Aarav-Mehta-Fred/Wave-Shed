@@ -10,6 +10,7 @@ if (typeof Flac !== 'undefined') {
 
 let accessHandle = null;
 let fileHandle = null;
+let hostRawFileName = null;
 let workletPort = null;
 
 // Per-guest OPFS file state, keyed by guestId (their peerId).
@@ -20,6 +21,10 @@ let extractFileSize = 0;
 const CHUNK_SIZE = 16 * 1024;
 
 let muteLog = [];
+
+let db = null;
+let guestFlacFileNames = new Map();
+let guestDecompressedFileNames = new Map();
 
 // Polls until libFLAC is fully initialized and ready to use.
 async function waitFlac() {
@@ -128,6 +133,8 @@ async function ensureGuestFile(guestId) {
         const access = await handle.createSyncAccessHandle();
         const entry = { fileHandle: handle, accessHandle: access, fileName };
         guestFiles.set(guestId, entry);
+        guestFlacFileNames.set(guestId, fileName);
+        self.postMessage({ type: 'GUEST_FILE_CREATED', guestId, fileName });
         return entry;
     } catch (error) {
         self.postMessage({ type: 'ERROR', message: `Failed to access Guest OPFS for ${guestId}: ${error.message}` });
@@ -141,6 +148,7 @@ async function initFile() {
     try {
         const root = await navigator.storage.getDirectory();
         const fileName = `recording-${Date.now()}.raw`;
+        hostRawFileName = fileName;
         fileHandle = await root.getFileHandle(fileName, { create: true });
         accessHandle = await fileHandle.createSyncAccessHandle();
         self.postMessage({ type: 'STATUS', status: 'READY', fileName });
@@ -171,6 +179,59 @@ async function processMessage(msg, ports) {
     if (msg.type === 'INIT_PORT') {
         workletPort = ports ? ports[0] : null;
         workletPort.onmessage = (event) => handleAudioMessage(event.data);
+    }
+    else if (msg.type === 'OPEN_DB') {
+        return new Promise((resolve, reject) => {
+            const request = indexedDB.open('waveshed_db', 1);
+
+            request.onupgradeneeded = (e) => {
+                const db = e.target.result;
+                if (!db.objectStoreNames.contains('sessions')) {
+                    db.createObjectStore('sessions', { keyPath: 'id' });
+                }
+                if (!db.objectStoreNames.contains('telemetry')) {
+                    db.createObjectStore('telemetry', { keyPath: 'id' });
+                }
+                if (!db.objectStoreNames.contains('downloads')) {
+                    db.createObjectStore('downloads', { keyPath: 'id' });
+                }
+            };
+
+            request.onsuccess = (e) => {
+                db = e.target.result;
+                self.postMessage({ type: 'STATUS', status: 'DB_OPENED' });
+                resolve();
+            };
+            request.onerror = (e) => {
+                self.postMessage({ type: 'ERROR', message: 'Worker IDB Error: ' + e.target.error.message });
+                reject(e.target.error);
+            };
+        });
+    }
+    else if (msg.type === 'WRITE_TELEMETRY') {
+        if (!db) {
+            self.postMessage({ type: 'ERROR', message: 'DB not opened in worker.' });
+            return;
+        }
+        const record = msg.record;
+        record.muteLog = muteLog;
+        return new Promise((resolve, reject) => {
+            try {
+                const tx = db.transaction('telemetry', 'readwrite');
+                const store = tx.objectStore('telemetry');
+                store.put(record);
+                tx.oncomplete = () => {
+                    resolve();
+                };
+                tx.onerror = (e) => {
+                    self.postMessage({ type: 'ERROR', message: 'Worker IDB Put Error: ' + e.target.error.message });
+                    reject(e.target.error);
+                };
+            } catch(e) {
+                self.postMessage({ type: 'ERROR', message: 'Worker IDB Exception: ' + e.message });
+                reject(e);
+            }
+        });
     }
     else if (msg.type === 'CLOSING') {
         // Only close the host/guest's OWN local recording file.
@@ -248,6 +309,9 @@ async function processMessage(msg, ports) {
             
             await decompressFile(entry.fileHandle, decompressedHandle, guestId);
             
+            // Track intermediate for deletion
+            guestDecompressedFileNames.set(guestId, decompressedName);
+
             // Point the guest entry to the decompressed file for cropping later.
             entry.fileHandle = decompressedHandle;
             entry.accessHandle = null;
@@ -266,8 +330,20 @@ async function processMessage(msg, ports) {
             wallTime: Date.now()
         });
     }
-    else if (msg.type === 'GET_TELEMETRY_EXTRAS') {
-        self.postMessage({ type: 'TELEMETRY_EXTRAS', muteLog: muteLog });
+
+    else if (msg.type === 'DELETE_FILES') {
+        try {
+            const root = await navigator.storage.getDirectory();
+            for (const fileName of msg.fileNames) {
+                try {
+                    const h = await root.getFileHandle(fileName);
+                    await h.remove();
+                } catch (e) { /* Ignore if it doesn't exist */ }
+            }
+            self.postMessage({ type: 'FILES_DELETED' });
+        } catch (e) {
+            self.postMessage({ type: 'ERROR', message: 'Failed to delete files: ' + e.message });
+        }
     }
 }
 
@@ -343,6 +419,22 @@ async function processSyncCrops(hostCropBytes, guestCrops) {
         }
 
         self.postMessage({ type: 'CROP_DONE', hostFile: hostName, guestFiles: resultFiles });
+        
+        // Clean up intermediate files
+        const intermediateFiles = [];
+        if (hostRawFileName) {
+            intermediateFiles.push(hostRawFileName);
+        }
+        for (const [id, fName] of guestFlacFileNames) {
+            intermediateFiles.push(fName);
+        }
+        for (const [id, fName] of guestDecompressedFileNames) {
+            intermediateFiles.push(fName);
+        }
+        
+        messageQueue = messageQueue.then(() => processMessage({ type: 'DELETE_FILES', fileNames: intermediateFiles }, null)).catch(err => {
+            self.postMessage({ type: 'ERROR', message: 'Worker Queue Deletion Error: ' + err.message });
+        });
         
     } catch (e) {
         self.postMessage({ type: 'ERROR', message: 'Failed to crop files: ' + e.message });

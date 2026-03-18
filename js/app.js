@@ -161,6 +161,242 @@ window.app = {
     onMuteStateChanged: function(peerId, isMuted) {
         console.log(`[UI] Participant ${peerId} is now ${isMuted ? 'muted' : 'unmuted'}.`);
         // Update roster UI indicator
+    },
+
+    /**
+     * Called by audio.js in initHost() once the peer ID is known.
+     * Creates the initial session record in IndexedDB with status 'recording'.
+     * @param {string} sessionId
+     * @param {string} hostName
+     */
+    onSessionCreated: async function(sessionId, hostName, rawHostFileName, localSampleRate) {
+        if (!window.SessionDB) return;
+        try {
+            await window.SessionDB.createSession({
+                id: sessionId,
+                createdAt: Date.now(),
+                hostName: hostName,
+                status: 'recording',
+                rawHostFile: rawHostFileName || '',
+                rawGuestFiles: {},
+                alignedHostFile: '',
+                alignedGuestFiles: {},
+                hostCropBytes: 0,
+                guestCrops: [],
+                participants: [],
+                durationSecs: 0,
+                sampleRate: localSampleRate || 44100
+            });
+        } catch(e) {
+            console.error('[SessionDB] onSessionCreated error:', e);
+        }
+    },
+
+    /**
+     * Called by audio.js from the GUEST_FILE_CREATED worker message.
+     * Updates rawGuestFiles in the session record.
+     * @param {string} guestId
+     * @param {string} fileName
+     */
+    onGuestFileCreated: async function(sessionId, guestId, fileName) {
+        if (!window.SessionDB) return;
+        try {
+            if (!sessionId) return;
+            const session = await window.SessionDB.getSession(sessionId);
+            if (session) {
+                const updatedFiles = session.rawGuestFiles || {};
+                updatedFiles[guestId] = fileName;
+                await window.SessionDB.updateSession(sessionId, { rawGuestFiles: updatedFiles });
+            }
+        } catch(e) {
+            console.error('[SessionDB] onGuestFileCreated error:', e);
+        }
+    },
+
+    /**
+     * Called by audio.js from the CROP_DONE handler.
+     * Updates the session record: sets status to 'complete', stores alignedHostFile,
+     * alignedGuestFiles, hostCropBytes, guestCrops, durationSecs, and participants.
+     * @param {string} sessionId
+     * @param {{ hostFile: string, guestFiles: { [peerId]: string } }} alignedFiles
+     */
+    onProcessingComplete: async function(sessionId, alignedFiles, guests, guestTelemetryMap, localSampleRate) {
+        if (!window.SessionDB) return;
+        try {
+            const participants = [];
+            if (guests) {
+                for (const [id, g] of guests) {
+                    const tel = guestTelemetryMap ? guestTelemetryMap.get(id) : null;
+                    participants.push({
+                        peerId: id,
+                        name: g.name,
+                        sampleRate: tel?.guestSampleRate || localSampleRate || 44100,
+                        inputLatency: tel?.guestInputLatency || 0
+                    });
+                }
+            }
+            
+            let durationSecs = 0;
+            try {
+                const root = await navigator.storage.getDirectory();
+                const h = await root.getFileHandle(alignedFiles.hostFile);
+                const f = await h.getFile();
+                const sr = localSampleRate || 44100;
+                durationSecs = f.size / (sr * 4);
+            } catch(e) {
+                console.error('[SessionDB] Could not compute duration:', e);
+            }
+
+            // hostCropBytes and guestCrops are already saved in runSyncAndPostProcessing!
+            await window.SessionDB.updateSession(sessionId, {
+                status: 'complete',
+                alignedHostFile: alignedFiles.hostFile,
+                alignedGuestFiles: alignedFiles.guestFiles,
+                participants: participants,
+                durationSecs: durationSecs
+            });
+        } catch(e) {
+            console.error('[SessionDB] onProcessingComplete error:', e);
+        }
+    },
+
+    /**
+     * Called by audio.js or the UI on any unrecoverable worker error.
+     * Sets status to 'error' in the session record.
+     * @param {string} sessionId
+     * @param {string} reason
+     */
+    onSessionError: async function(sessionId, reason) {
+        if (!window.SessionDB) return;
+        try {
+            await window.SessionDB.updateSession(sessionId, { status: 'error' });
+            console.error('[Session Error]', reason);
+        } catch(e) {}
+    },
+
+    /**
+     * Triggers a WAV download for a specific track and logs it to the 'downloads' store.
+     * @param {string} sessionId
+     * @param {'raw_host'|'raw_guest'|'aligned_host'|'aligned_guest'} type
+     * @param {string|null} peerId
+     */
+    requestDownload: async function(sessionId, type, peerId = null) {
+        if (!window.SessionDB) return;
+        try {
+            const session = await window.SessionDB.getSession(sessionId);
+            if (!session) return;
+            
+            let fileName = null;
+            let sampleRate = session.sampleRate || 44100;
+            
+            if (type === 'raw_host') fileName = session.rawHostFile;
+            else if (type === 'raw_guest') {
+                fileName = (session.rawGuestFiles || {})[peerId];
+                if (session.participants) {
+                    const p = session.participants.find(p => p.peerId === peerId);
+                    if (p && p.sampleRate) sampleRate = p.sampleRate;
+                }
+            }
+            else if (type === 'aligned_host') fileName = session.alignedHostFile;
+            else if (type === 'aligned_guest') {
+                fileName = (session.alignedGuestFiles || {})[peerId];
+                if (session.participants) {
+                    const p = session.participants.find(p => p.peerId === peerId);
+                    if (p && p.sampleRate) sampleRate = p.sampleRate;
+                }
+            }
+            
+            if (fileName && window.AudioSync && window.AudioSync.downloadTrack) {
+                await window.AudioSync.downloadTrack(fileName, sampleRate);
+                await window.SessionDB.logDownload({
+                    id: `${sessionId}_${type}_${peerId || 'host'}`,
+                    sessionId: sessionId,
+                    type: type,
+                    peerId: peerId,
+                    downloadedAt: Date.now()
+                });
+            } else {
+                console.error('[SessionDB] Could not find track or downloadTrack not available for type:', type);
+            }
+        } catch(e) { console.error('[SessionDB] requestDownload error:', e); }
+    },
+
+    /**
+     * Downloads all aligned tracks for a session by calling requestDownload for each.
+     * @param {string} sessionId
+     */
+    requestBulkDownload: async function(sessionId) {
+        if (!window.SessionDB) return;
+        try {
+            const session = await window.SessionDB.getSession(sessionId);
+            if (!session) return;
+            await this.requestDownload(sessionId, 'aligned_host');
+            for (const peerId of Object.keys(session.alignedGuestFiles || {})) {
+                await this.requestDownload(sessionId, 'aligned_guest', peerId);
+            }
+        } catch(e) { console.error('[SessionDB] requestBulkDownload error:', e); }
+    },
+
+    /**
+     * Returns all session records sorted by createdAt descending.
+     * @returns {Promise<object[]>}
+     */
+    getSessions: async function() {
+        if (!window.SessionDB) return [];
+        return await window.SessionDB.getAllSessions();
+    },
+
+    /**
+     * Returns a single session record plus all telemetry records for that session.
+     * @param {string} sessionId
+     * @returns {Promise<{ session: object, telemetry: object[] }>}
+     */
+    getSessionDetail: async function(sessionId) {
+        if (!window.SessionDB) return { session: null, telemetry: [] };
+        const session = await window.SessionDB.getSession(sessionId);
+        const telemetry = await window.SessionDB.getTelemetry(sessionId);
+        return { session, telemetry };
+    },
+
+    /**
+     * Deletes a session and all its associated data.
+     * @param {string} sessionId
+     */
+    deleteSession: async function(sessionId) {
+        if (!window.SessionDB) return;
+        try {
+            const session = await window.SessionDB.getSession(sessionId);
+            if (!session) return;
+
+            if (session.status === 'recording' || session.status === 'processing') {
+                console.warn(`[SessionDB] Cannot delete session ${sessionId} while it is ${session.status}.`);
+                return;
+            }
+
+            const fileNames = [session.alignedHostFile].filter(Boolean);
+            if (session.alignedGuestFiles) {
+                fileNames.push(...Object.values(session.alignedGuestFiles));
+            }
+
+            let dispatched = false;
+            if (window.AudioSync && window.AudioSync.deleteFiles) {
+                dispatched = await window.AudioSync.deleteFiles(fileNames);
+            }
+
+            if (!dispatched) {
+                const root = await navigator.storage.getDirectory();
+                for (const fileName of fileNames) {
+                    try {
+                        const h = await root.getFileHandle(fileName);
+                        await h.remove();
+                    } catch(e) {}
+                }
+            }
+
+            await window.SessionDB.deleteSessions(sessionId);
+        } catch(e) {
+            console.error('[SessionDB] deleteSession error:', e);
+        }
     }
 };
 
@@ -178,6 +414,11 @@ window.addEventListener('beforeunload', (e) => {
 });
 
 window.addEventListener('DOMContentLoaded', async () => {
+    // Open the DB First
+    if (window.SessionDB && window.SessionDB.open) {
+        await window.SessionDB.open().catch(e => console.error('Failed to open DB:', e));
+    }
+
     // Request permissions and fetch available microphones as soon as the UI loads
     const microphones = await window.app.requestMicrophoneAccess();
     

@@ -10,6 +10,8 @@ let mediaStreamSource = null;
 
 let isHost = false;
 let peerId = null;
+let currentSessionId = null;
+let rawHostFileName = null;
 let isRecording = false;
 let isMuted = false;
 
@@ -199,6 +201,12 @@ function initHost(selectedMicId = null, participantInfo = {}, existingMeetingId 
         if (window.WakeLock) window.WakeLock.acquire();
         if (window.app && window.app.setSessionState) window.app.setSessionState('in_meeting');
         
+        currentSessionId = 'sess_' + Date.now();
+        audioWorker.postMessage({ type: 'OPEN_DB' });
+        if (rawHostFileName && window.app && window.app.onSessionCreated) {
+            window.app.onSessionCreated(currentSessionId, localName, rawHostFileName, localSampleRate);
+        }
+
         // Save session for reconnection
         localStorage.setItem('waveshed_session', JSON.stringify({
             role: 'host',
@@ -508,7 +516,14 @@ function sendToHost(msg) {
 function handleWorkerMessage(e) {
     const msg = e.data;
     if (msg.type === 'STATUS') {
-        console.log('Worker OPFS File:', msg.fileName);
+        if (msg.status === 'READY') {
+            rawHostFileName = msg.fileName;
+            console.log('Worker OPFS File:', msg.fileName);
+        }
+    } else if (msg.type === 'GUEST_FILE_CREATED') {
+        if (isHost && window.app && window.app.onGuestFileCreated) {
+            window.app.onGuestFileCreated(currentSessionId, msg.guestId, msg.fileName);
+        }
     } else if (msg.type === 'COMPRESS_PROGRESS') {
         if (window.app && window.app.updateProgress) {
             window.app.updateProgress('compressing', msg.current, msg.total);
@@ -553,30 +568,40 @@ function handleWorkerMessage(e) {
             sendToGuest(msg.guestId, { type: 'ACK_READ' });
         }
     } else if (msg.type === 'CROP_DONE') {
-        console.log("Processing complete. Final files are available in OPFS.");
-        
-        // Download the host file.
-        downloadAsWav(msg.hostFile, localSampleRate);
-        
-        // Download each guest file.
-        for (const [guestId, fileName] of Object.entries(msg.guestFiles)) {
-            const telemetry = guestTelemetryMap.get(guestId);
-            const guestSR = telemetry ? (telemetry.guestSampleRate || localSampleRate) : localSampleRate;
-            downloadAsWav(fileName, guestSR);
-        }
+        (async () => {
+            console.log("Processing complete. Final files are available in OPFS.");
+            
+            if (window.app && window.app.onProcessingComplete) {
+                await window.app.onProcessingComplete(currentSessionId, { hostFile: msg.hostFile, guestFiles: msg.guestFiles }, guests, guestTelemetryMap, localSampleRate);
+            }
+            
+            try {
+                // Download the host file.
+                if (window.app && window.app.requestDownload) {
+                    await window.app.requestDownload(currentSessionId, 'aligned_host');
+                    
+                    // Download each guest file.
+                    for (const [guestId, fileName] of Object.entries(msg.guestFiles)) {
+                        await window.app.requestDownload(currentSessionId, 'aligned_guest', guestId);
+                    }
+                }
+            } catch (err) {
+                console.error('[Audio] error during automatic downloads:', err);
+            }
 
-        if (endMeetingAfterCrop) {
-            broadcastToGuests({ type: 'MEETING_ENDED' });
-            if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
-            if (commsStream) commsStream.getTracks().forEach(t => t.stop());
-            if (audioWorker) audioWorker.terminate();
-            if (peer) peer.destroy();
-            localStorage.removeItem('waveshed_session');
-            localStorage.removeItem('waveshed_admitted_guests');
-            if (window.WakeLock) window.WakeLock.release();
-            if (window.app && window.app.setSessionState) window.app.setSessionState('idle');
-            endMeetingAfterCrop = false;
-        }
+            if (endMeetingAfterCrop) {
+                broadcastToGuests({ type: 'MEETING_ENDED' });
+                if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+                if (commsStream) commsStream.getTracks().forEach(t => t.stop());
+                if (audioWorker) audioWorker.terminate();
+                if (peer) peer.destroy();
+                localStorage.removeItem('waveshed_session');
+                localStorage.removeItem('waveshed_admitted_guests');
+                if (window.WakeLock) window.WakeLock.release();
+                if (window.app && window.app.setSessionState) window.app.setSessionState('idle');
+                endMeetingAfterCrop = false;
+            }
+        })();
     } else if (msg.type === 'FILE_CLOSED') {
         if (!isHost) {
             // Guest file is finalized, safe to begin extraction.
@@ -585,8 +610,11 @@ function handleWorkerMessage(e) {
             // Solo recording: no guests, go straight to cropping.
             runSyncAndPostProcessing();
         }
-    } else if (msg.type === 'TELEMETRY_EXTRAS') {
-        sendTelemetry({ muteLog: msg.muteLog });
+    } else if (msg.type === 'ERROR') {
+        console.error('[Worker Error]', msg.message);
+        if (currentSessionId && isHost) {
+            window.app.onSessionError(currentSessionId, msg.message);
+        }
     }
 }
 
@@ -631,9 +659,14 @@ async function downloadAsWav(fileName, sampleRate) {
         const blob = new Blob([headerBuffer, file], { type: 'audio/wav' });
         const objectUrl = URL.createObjectURL(blob);
         console.log(`[Download] WAV ready: ${fileName.replace('.raw', '.wav')} | URL: ${objectUrl}`);
-        URL.revokeObjectURL(objectUrl);
         
-        // TODO: Replace with anchor.click() when UI exists.
+        const a = document.createElement('a');
+        a.href = objectUrl;
+        a.download = fileName.replace('.raw', '.wav');
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(objectUrl), 10000);
     } catch (error) {
         console.error('Error creating WAV file:', fileName, error);
     }
@@ -1030,11 +1063,7 @@ function extractGuestData() {
 }
 
 function finalizeGuestExtraction() {
-    if (audioWorker) {
-        audioWorker.postMessage({ type: 'GET_TELEMETRY_EXTRAS' });
-    } else {
-        sendTelemetry({});
-    }
+    sendTelemetry({});
 }
 
 function sendTelemetry(extras) {
@@ -1111,8 +1140,29 @@ function runSyncAndPostProcessing() {
         console.log(`[Sync ${guestId.slice(-6)}] Crop Length: ${guestCropLength.toFixed(5)}s | Crop Bytes: ${guestCropBytes} (SR: ${guestSampleRate})`);
 
         guestCrops.push({
+            peerId: guestId, // Using peerId as standard naming in IDB/Session format
             guestId,
             cropBytes: Math.max(0, guestCropBytes)
+        });
+
+        // Send telemetry to IDB via worker before crop
+        audioWorker.postMessage({
+            type: 'WRITE_TELEMETRY',
+            record: {
+                id: `${currentSessionId}_${guestId}`,
+                sessionId: currentSessionId,
+                peerId: guestId,
+                guestName: guests.get(guestId)?.name || 'Guest',
+                guestRecordingStart: telemetry.guestRecordingStart,
+                guestSampleRate: telemetry.guestSampleRate,
+                guestInputLatency: telemetry.guestInputLatency,
+                isLateJoin: telemetry.isLateJoin,
+                lateJoinTime: telemetry.lateJoinTime,
+                networkTests: guestNetworkTests.get(guestId) || [],
+                bestRTT: minRTT,
+                startOffset: startOffset,
+                stopHandshake: guestStopHandshakes.get(guestId) || null
+            }
         });
     }
 
@@ -1120,6 +1170,13 @@ function runSyncAndPostProcessing() {
     const hostCropLength = (hostCountdownStart + 5.0) - hostRecordingStart;
     const hostCropBytes = Math.floor(hostCropLength * localSampleRate) * 4;
     console.log(`[Sync] Host Crop Length: ${hostCropLength.toFixed(5)}s | Crop Bytes: ${hostCropBytes}`);
+
+    if (window.SessionDB && currentSessionId) {
+        window.SessionDB.updateSession(currentSessionId, {
+            hostCropBytes: Math.max(0, hostCropBytes),
+            guestCrops: guestCrops
+        }).catch(err => console.error('Failed to save crop bytes to DB:', err));
+    }
 
     audioWorker.postMessage({
         type: 'CROP_FILES',
@@ -1139,7 +1196,15 @@ window.AudioSync = {
     switchMicrophone,
     leaveSession,
     endMeeting,
-    setMuted
+    setMuted,
+    downloadTrack: downloadAsWav,
+    deleteFiles: async function(fileNames) {
+        if (audioWorker) {
+            audioWorker.postMessage({ type: 'DELETE_FILES', fileNames });
+            return true;
+        }
+        return false;
+    }
 };
 
 // --- New Feature Functions ---
