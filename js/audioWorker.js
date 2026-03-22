@@ -26,6 +26,9 @@ let db = null;
 let guestFlacFileNames = new Map();
 let guestDecompressedFileNames = new Map();
 
+// Current take ID, updated by INIT_TAKE
+let currentTakeId = null;
+
 // Polls until libFLAC is fully initialized and ready to use.
 async function waitFlac() {
     while (typeof Flac === 'undefined' || !Flac.isReady()) {
@@ -134,7 +137,7 @@ async function ensureGuestFile(guestId) {
         const entry = { fileHandle: handle, accessHandle: access, fileName };
         guestFiles.set(guestId, entry);
         guestFlacFileNames.set(guestId, fileName);
-        self.postMessage({ type: 'GUEST_FILE_CREATED', guestId, fileName });
+        self.postMessage({ type: 'GUEST_FILE_CREATED', guestId, fileName, takeId: currentTakeId });
         return entry;
     } catch (error) {
         self.postMessage({ type: 'ERROR', message: `Failed to access Guest OPFS for ${guestId}: ${error.message}` });
@@ -143,6 +146,7 @@ async function ensureGuestFile(guestId) {
 }
 
 // Creates the OPFS file for the local (host or guest's own) recording.
+// Used both on initial worker startup and on INIT_TAKE.
 async function initFile() {
     muteLog = []; // Reset for new recording session
     try {
@@ -151,13 +155,20 @@ async function initFile() {
         hostRawFileName = fileName;
         fileHandle = await root.getFileHandle(fileName, { create: true });
         accessHandle = await fileHandle.createSyncAccessHandle();
-        self.postMessage({ type: 'STATUS', status: 'READY', fileName });
+        return fileName;
     } catch (error) {
         self.postMessage({ type: 'ERROR', message: 'Failed to access OPFS: ' + error.message });
+        return null;
     }
 }
 
-initFile();
+// Initial file creation on worker startup
+(async () => {
+    const fileName = await initFile();
+    if (fileName) {
+        self.postMessage({ type: 'STATUS', status: 'READY', fileName });
+    }
+})();
 
 function handleAudioMessage(msg) {
     if (msg.type === 'pcm-data' && accessHandle) {
@@ -182,7 +193,7 @@ async function processMessage(msg, ports) {
     }
     else if (msg.type === 'OPEN_DB') {
         return new Promise((resolve, reject) => {
-            const request = indexedDB.open('waveshed_db', 1);
+            const request = indexedDB.open('waveshed_db', 3);
 
             request.onupgradeneeded = (e) => {
                 const db = e.target.result;
@@ -194,6 +205,18 @@ async function processMessage(msg, ports) {
                 }
                 if (!db.objectStoreNames.contains('downloads')) {
                     db.createObjectStore('downloads', { keyPath: 'id' });
+                }
+                if (e.oldVersion < 2) {
+                    const takesStore = db.createObjectStore('takes', { keyPath: 'takeId' });
+                    takesStore.createIndex('sessionId', 'sessionId', { unique: false });
+                }
+                if (e.oldVersion < 3) {
+                    const transcriptsStore = db.createObjectStore('transcripts', { keyPath: 'id' });
+                    transcriptsStore.createIndex('sessionId', 'sessionId', { unique: false });
+                    transcriptsStore.createIndex('takeId', 'takeId', { unique: false });
+
+                    const editsStore = db.createObjectStore('edits', { keyPath: 'takeId' });
+                    editsStore.createIndex('sessionId', 'sessionId', { unique: false });
                 }
             };
 
@@ -208,6 +231,40 @@ async function processMessage(msg, ports) {
             };
         });
     }
+    else if (msg.type === 'INIT_TAKE') {
+        // Begin a new take: flush/close any existing handle, reset per-take state,
+        // create a fresh OPFS file.
+        currentTakeId = msg.takeId;
+
+        if (accessHandle) {
+            try {
+                accessHandle.flush();
+                accessHandle.close();
+            } catch (e) { /* already closed */ }
+            accessHandle = null;
+        }
+
+        muteLog = [];
+        guestFiles = new Map();
+        guestFlacFileNames = new Map();
+        guestDecompressedFileNames = new Map();
+
+        const newFileName = await initFile();
+        if (newFileName) {
+            self.postMessage({ type: 'STATUS', status: 'TAKE_READY', fileName: newFileName, takeId: msg.takeId, takeName: msg.takeName });
+        }
+    }
+    else if (msg.type === 'CLOSE_TAKE') {
+        // Called when recording stops at the end of a take, before extract/transfer.
+        if (accessHandle) {
+            try {
+                accessHandle.flush();
+                accessHandle.close();
+            } catch (e) { /* already closed */ }
+            accessHandle = null;
+        }
+        self.postMessage({ type: 'STATUS', status: 'TAKE_CLOSED' });
+    }
     else if (msg.type === 'WRITE_TELEMETRY') {
         if (!db) {
             self.postMessage({ type: 'ERROR', message: 'DB not opened in worker.' });
@@ -215,6 +272,9 @@ async function processMessage(msg, ports) {
         }
         const record = msg.record;
         record.muteLog = muteLog;
+        if (msg.takeId) {
+            record.takeId = msg.takeId;
+        }
         return new Promise((resolve, reject) => {
             try {
                 const tx = db.transaction('telemetry', 'readwrite');
@@ -309,7 +369,7 @@ async function processMessage(msg, ports) {
             
             await decompressFile(entry.fileHandle, decompressedHandle, guestId);
             
-            // Track intermediate for deletion
+            // Track decompressed raw filename, preserved as the persistent guest raw file.
             guestDecompressedFileNames.set(guestId, decompressedName);
 
             // Point the guest entry to the decompressed file for cropping later.
@@ -321,7 +381,22 @@ async function processMessage(msg, ports) {
         }
     }
     else if (msg.type === 'CROP_FILES') {
-        await processSyncCrops(msg.hostCropBytes, msg.guestCrops);
+        await processSyncCrops(msg.hostCropBytes, msg.guestCrops, msg.takeId);
+    }
+    else if (msg.type === 'CROP_AUDIO') {
+        try {
+            const root = await navigator.storage.getDirectory();
+            const srcHandle = await root.getFileHandle(msg.sourceFile);
+            const srcFile = await srcHandle.getFile();
+            const outHandle = await root.getFileHandle(msg.outputFile, { create: true });
+            const outAccess = await outHandle.createSyncAccessHandle();
+            await copyWithCrop(srcFile, msg.cropBytes, outAccess);
+            outAccess.flush();
+            outAccess.close();
+            self.postMessage({ type: 'CROP_AUDIO_DONE', outputFile: msg.outputFile });
+        } catch (e) {
+            self.postMessage({ type: 'ERROR', message: 'CROP_AUDIO failed: ' + e.message });
+        }
     }
     else if (msg.type === 'MUTE_EVENT') {
         muteLog.push({
@@ -368,18 +443,10 @@ async function readNextChunk(file) {
     readOffset = limit;
 }
 
-// Crop the host file and each guest file to align them after sync calculations.
+// Build result map and post CROP_DONE with crop offsets — no cropped files are created.
 // guestCrops is an array of { guestId, cropBytes }.
-async function processSyncCrops(hostCropBytes, guestCrops) {
+async function processSyncCrops(hostCropBytes, guestCrops, takeId) {
     try {
-        const root = await navigator.storage.getDirectory();
-        const timestamp = Date.now();
-
-        // Crop the host file.
-        const hostName = `final-host-${timestamp}.raw`;
-        const finalHostFile = await root.getFileHandle(hostName, { create: true });
-        const finalHostAccess = await finalHostFile.createSyncAccessHandle();
-
         // Close any lingering write handles before reading.
         if (accessHandle) {
             accessHandle.flush();
@@ -387,12 +454,8 @@ async function processSyncCrops(hostCropBytes, guestCrops) {
             accessHandle = null;
         }
 
-        const hostReadFile = await fileHandle.getFile();
-        await copyWithCrop(hostReadFile, hostCropBytes, finalHostAccess);
-        finalHostAccess.close();
-
-        // Crop each guest file in sequence (OPFS sync handles can't truly parallelize).
-        const resultFiles = {};
+        // Build a result map: { [guestId]: { fileName, cropBytes } }
+        const resultMap = {};
         for (const cropInfo of guestCrops) {
             const entry = guestFiles.get(cropInfo.guestId);
             if (!entry) {
@@ -400,44 +463,42 @@ async function processSyncCrops(hostCropBytes, guestCrops) {
                 continue;
             }
 
-            // Close any open access handle so we can read the file.
+            // Close any open access handle so the file is readable later.
             if (entry.accessHandle) {
                 entry.accessHandle.flush();
                 entry.accessHandle.close();
                 entry.accessHandle = null;
             }
 
-            const guestName = `final-guest-${cropInfo.guestId.slice(-6)}-${timestamp}.raw`;
-            const finalGuestFile = await root.getFileHandle(guestName, { create: true });
-            const finalGuestAccess = await finalGuestFile.createSyncAccessHandle();
-
-            const guestReadFile = await entry.fileHandle.getFile();
-            await copyWithCrop(guestReadFile, cropInfo.cropBytes, finalGuestAccess);
-            finalGuestAccess.close();
-
-            resultFiles[cropInfo.guestId] = guestName;
+            const rawFileName = guestDecompressedFileNames.get(cropInfo.guestId) || entry.fileName;
+            resultMap[cropInfo.guestId] = {
+                fileName: rawFileName,
+                cropBytes: cropInfo.cropBytes
+            };
         }
 
-        self.postMessage({ type: 'CROP_DONE', hostFile: hostName, guestFiles: resultFiles });
-        
-        // Clean up intermediate files
+        self.postMessage({
+            type: 'CROP_DONE',
+            takeId: takeId || currentTakeId,
+            hostFile: hostRawFileName,
+            hostCropBytes: hostCropBytes,
+            guestFiles: resultMap
+        });
+
+        // Delete only FLAC transfer intermediates — preserve raw host and guest decompressed files.
         const intermediateFiles = [];
-        if (hostRawFileName) {
-            intermediateFiles.push(hostRawFileName);
-        }
         for (const [id, fName] of guestFlacFileNames) {
             intermediateFiles.push(fName);
         }
-        for (const [id, fName] of guestDecompressedFileNames) {
-            intermediateFiles.push(fName);
+
+        if (intermediateFiles.length > 0) {
+            messageQueue = messageQueue.then(() => processMessage({ type: 'DELETE_FILES', fileNames: intermediateFiles }, null)).catch(err => {
+                self.postMessage({ type: 'ERROR', message: 'Worker Queue Deletion Error: ' + err.message });
+            });
         }
-        
-        messageQueue = messageQueue.then(() => processMessage({ type: 'DELETE_FILES', fileNames: intermediateFiles }, null)).catch(err => {
-            self.postMessage({ type: 'ERROR', message: 'Worker Queue Deletion Error: ' + err.message });
-        });
-        
+
     } catch (e) {
-        self.postMessage({ type: 'ERROR', message: 'Failed to crop files: ' + e.message });
+        self.postMessage({ type: 'ERROR', message: 'Failed to process crop offsets: ' + e.message });
     }
 }
 

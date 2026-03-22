@@ -53,6 +53,10 @@ let pendingTransfers = 0;
 let totalGuests = 0;
 let endMeetingAfterCrop = false;
 
+// Take state
+let currentTakeId = null;
+let takeCounter = 0;
+
 // ==========================================
 // Phase 1 - Setup & Audio Routing
 // ==========================================
@@ -203,8 +207,8 @@ function initHost(selectedMicId = null, participantInfo = {}, existingMeetingId 
         
         currentSessionId = 'sess_' + Date.now();
         audioWorker.postMessage({ type: 'OPEN_DB' });
-        if (rawHostFileName && window.app && window.app.onSessionCreated) {
-            window.app.onSessionCreated(currentSessionId, localName, rawHostFileName, localSampleRate);
+        if (window.app && window.app.onSessionCreated) {
+            window.app.onSessionCreated(currentSessionId, localName, null, localSampleRate);
         }
 
         // Save session for reconnection
@@ -519,6 +523,22 @@ function handleWorkerMessage(e) {
         if (msg.status === 'READY') {
             rawHostFileName = msg.fileName;
             console.log('Worker OPFS File:', msg.fileName);
+        } else if (msg.status === 'TAKE_READY') {
+            rawHostFileName = msg.fileName;
+            console.log('[Take] OPFS File ready:', msg.fileName);
+            if (isHost && window.app && window.app.onTakeCreated) {
+                window.app.onTakeCreated(msg.takeId, msg.takeName, msg.fileName, currentSessionId);
+            }
+            pcmProcessor.port.postMessage({ command: 'start_recording' });
+            isRecording = true;
+            if (window.app && window.app.setSessionState) window.app.setSessionState('recording');
+        } else if (msg.status === 'TAKE_CLOSED') {
+            console.log('[Take] OPFS file closed for take:', currentTakeId);
+            // Begin Phase 3 pipeline (same as stopRecordingProcess flow)
+            if (guests.size === 0) {
+                runSyncAndPostProcessing();
+            }
+            // If there are guests, the existing STOP_PONG -> CMD_EXTRACT -> transfer flow handles it
         }
     } else if (msg.type === 'GUEST_FILE_CREATED') {
         if (isHost && window.app && window.app.onGuestFileCreated) {
@@ -569,24 +589,20 @@ function handleWorkerMessage(e) {
         }
     } else if (msg.type === 'CROP_DONE') {
         (async () => {
-            console.log("Processing complete. Final files are available in OPFS.");
+            const cropTakeId = msg.takeId || currentTakeId;
+            console.log("Processing complete. Raw files preserved in OPFS. Take:", cropTakeId);
             
-            if (window.app && window.app.onProcessingComplete) {
-                await window.app.onProcessingComplete(currentSessionId, { hostFile: msg.hostFile, guestFiles: msg.guestFiles }, guests, guestTelemetryMap, localSampleRate);
-            }
-            
-            try {
-                // Download the host file.
-                if (window.app && window.app.requestDownload) {
-                    await window.app.requestDownload(currentSessionId, 'aligned_host');
-                    
-                    // Download each guest file.
-                    for (const [guestId, fileName] of Object.entries(msg.guestFiles)) {
-                        await window.app.requestDownload(currentSessionId, 'aligned_guest', guestId);
-                    }
-                }
-            } catch (err) {
-                console.error('[Audio] error during automatic downloads:', err);
+            if (window.app && window.app.onTakeComplete) {
+                await window.app.onTakeComplete(
+                    cropTakeId,
+                    msg.hostFile,
+                    msg.hostCropBytes,
+                    msg.guestFiles,   // { [guestId]: { fileName, cropBytes } }
+                    guests,
+                    guestTelemetryMap,
+                    localSampleRate,
+                    currentSessionId
+                );
             }
 
             if (endMeetingAfterCrop) {
@@ -599,34 +615,42 @@ function handleWorkerMessage(e) {
                 localStorage.removeItem('waveshed_admitted_guests');
                 if (window.WakeLock) window.WakeLock.release();
                 if (window.app && window.app.setSessionState) window.app.setSessionState('idle');
+                if (window.app && window.app.onSessionFinalized) window.app.onSessionFinalized(currentSessionId);
                 endMeetingAfterCrop = false;
             }
         })();
     } else if (msg.type === 'FILE_CLOSED') {
         if (!isHost) {
-            // Guest file is finalized, safe to begin extraction.
+            // Guest-side only: own recording file is finalized, safe to begin extraction.
+            // Host recording closure is handled via CLOSE_TAKE -> TAKE_CLOSED instead.
             extractGuestData();
-        } else if (guests.size === 0) {
-            // Solo recording: no guests, go straight to cropping.
-            runSyncAndPostProcessing();
         }
     } else if (msg.type === 'ERROR') {
         console.error('[Worker Error]', msg.message);
-        if (currentSessionId && isHost) {
-            window.app.onSessionError(currentSessionId, msg.message);
+        if (isHost) {
+            if (currentTakeId && window.app && window.app.onTakeError) {
+                window.app.onTakeError(currentTakeId, msg.message);
+            }
+            if (currentSessionId && window.app && window.app.onSessionError) {
+                window.app.onSessionError(currentSessionId, msg.message);
+            }
         }
     }
 }
 
 let expectedFileSize = 0;
 
-async function downloadAsWav(fileName, sampleRate) {
+const safeName = (s) => s.replace(/[\/\\:*?"<>|]/g, '-').trim();
+
+async function downloadAsWav(fileName, sampleRate, roomName, takeName, participantName, cropBytes = 0) {
     try {
         const root = await navigator.storage.getDirectory();
         
         const fileHandle = await root.getFileHandle(fileName);
         const file = await fileHandle.getFile();
-        const rawByteLength = file.size;
+        const croppedBlob = cropBytes > 0 ? file.slice(cropBytes) : file;
+        const croppedBuffer = await croppedBlob.arrayBuffer();
+        const rawByteLength = croppedBuffer.byteLength;
         
         const headerBuffer = new ArrayBuffer(44);
         const view = new DataView(headerBuffer);
@@ -656,13 +680,21 @@ async function downloadAsWav(fileName, sampleRate) {
         writeString(view, 36, 'data');
         view.setUint32(40, rawByteLength, true);
         
-        const blob = new Blob([headerBuffer, file], { type: 'audio/wav' });
+        const blob = new Blob([headerBuffer, croppedBuffer], { type: 'audio/wav' });
         const objectUrl = URL.createObjectURL(blob);
-        console.log(`[Download] WAV ready: ${fileName.replace('.raw', '.wav')} | URL: ${objectUrl}`);
+        
+        let downloadName;
+        if (roomName && takeName && participantName) {
+            downloadName = `${safeName(roomName)} \u2013 ${safeName(takeName)} \u2013 ${safeName(participantName)}.wav`;
+        } else {
+            downloadName = fileName.replace('.raw', '.wav');
+        }
+        
+        console.log(`[Download] WAV ready: ${downloadName} | URL: ${objectUrl}`);
         
         const a = document.createElement('a');
         a.href = objectUrl;
-        a.download = fileName.replace('.raw', '.wav');
+        a.download = downloadName;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
@@ -964,6 +996,44 @@ function handleGuestDataMessage(msg) {
     }
 }
 
+// --- Take lifecycle functions ---
+
+function resetTakeState() {
+    hostCountdownStart = 0;
+    hostRecordingStart = 0;
+    guestRecordingStart = 0;
+    lateJoinTime = 0;
+    pendingDecompressions = 0;
+    pendingTransfers = 0;
+    pendingStopPongs = 0;
+
+    guestNetworkTests.clear();
+    guestTestTimestamps.clear();
+    guestStopHandshakes.clear();
+    guestTelemetryMap.clear();
+    guestRecordingStarts.clear();
+    guestInitialRTTs.clear();
+    guestExpectedSizes.clear();
+    guestReceivedBytes.clear();
+}
+
+function startTake(name) {
+    resetTakeState();
+    takeCounter++;
+    currentTakeId = 'take_' + Date.now();
+    const takeName = name || 'Take ' + takeCounter;
+
+    audioWorker.postMessage({ type: 'INIT_TAKE', takeId: currentTakeId, takeName });
+}
+
+function stopTake() {
+    pcmProcessor.port.postMessage({ command: 'stop_recording' });
+    isRecording = false;
+
+    // CLOSE_TAKE flushes/closes the handle; TAKE_CLOSED triggers Phase 3 for solo.
+    audioWorker.postMessage({ type: 'CLOSE_TAKE' });
+}
+
 // Called from the UI to begin the recording sequence.
 // Runs the initial ping sequentially for each guest, then floods network tests,
 // then starts the countdown.
@@ -1002,11 +1072,9 @@ async function startRecordingProcess() {
 
     // Step 2: Record the countdown start time and fire countdowns everywhere.
     hostCountdownStart = audioContext.currentTime;
-    isRecording = true;
     if (window.app && window.app.startCountdown) {
         window.app.startCountdown(5);
     }
-    if (window.app && window.app.setSessionState) window.app.setSessionState('recording');
 
     // Send START_RECORDING_CMD to each guest, offset by their individual half-RTT.
     for (const guestId of guestIds) {
@@ -1023,18 +1091,17 @@ async function startRecordingProcess() {
     }, 80);
     setTimeout(() => clearInterval(testInterval), 4000);
 
-    // Step 4: Trigger host recording at 4.5s into the countdown.
+    // Step 4: Start the first take at 4.5s into the countdown.
+    // startTake sends INIT_TAKE to the worker; the TAKE_READY handler starts the worklet.
     setTimeout(() => {
-        pcmProcessor.port.postMessage({ command: 'start_recording' });
-        console.log('Host start recording command sent');
+        startTake();
+        console.log('Host start recording via startTake()');
     }, 4500);
 }
 
 // Called from the UI to end the recording and begin extraction from all guests.
 function stopRecordingProcess() {
     if (!isHost) return;
-    pcmProcessor.port.postMessage({ command: 'stop_recording' });
-    isRecording = false;
 
     const stopTime = audioContext.currentTime;
     if (window.app && window.app.setSessionState) window.app.setSessionState('transferring');
@@ -1048,9 +1115,8 @@ function stopRecordingProcess() {
         sendToGuest(guestId, { type: 'STOP_PING' });
     }
 
-
-    // Give the worklet time to finish flushing, then close the host file.
-    setTimeout(() => audioWorker.postMessage({ type: 'CLOSING' }), 50);
+    // Stop the current take (stops worklet, sends CLOSE_TAKE to worker).
+    stopTake();
 }
 
 // ==========================================
@@ -1082,10 +1148,68 @@ function sendTelemetry(extras) {
 // Phase 4 - Sync & Post-Processing
 // ==========================================
 
+/**
+ * Pure function: computes crop byte offsets for host and a single guest track.
+ * Can be called standalone (by ai.js with stored telemetry) without a live session.
+ */
+function computeCropParams({
+    networkTests,        // array of { T0, T1, T2, T3 }
+    telemetry,           // { guestRecordingStart, guestSampleRate, guestInputLatency, isLateJoin, lateJoinTime }
+    stopHandshake,       // { T4, T5, T6, T7 } or null
+    hostCountdownStart,  // number (AudioContext time)
+    hostRecordingStart,  // number (AudioContext time)
+    hostSampleRate       // number
+}) {
+    const tests = networkTests || [];
+
+    // Find the network test with the lowest RTT.
+    let bestTest = null;
+    let minRTT = Infinity;
+
+    tests.forEach(test => {
+        if (!test.T3) return;
+        const rtt = (test.T3 - test.T0) - (test.T2 - test.T1);
+        if (rtt < minRTT) {
+            minRTT = rtt;
+            bestTest = test;
+        }
+    });
+
+    if (!bestTest) return null;
+
+    const { T0, T1 } = bestTest;
+    const startOffset = (T0 + (minRTT / 2)) - T1;
+
+    // Calculate the clock offset at the time of the stop handshake.
+    let stopOffset = startOffset; // fallback
+    if (stopHandshake && stopHandshake.T7) {
+        const stopRTT = (stopHandshake.T7 - stopHandshake.T4) - (stopHandshake.T6 - stopHandshake.T5);
+        stopOffset = (stopHandshake.T4 + (stopRTT / 2)) - stopHandshake.T5;
+    }
+
+    // Both recordings start at the countdown origin (hostCountdownStart + 5.0s).
+    const mappedGuestStart = telemetry.guestRecordingStart + startOffset;
+    const guestCropLength = (hostCountdownStart + 5.0) - mappedGuestStart;
+    const guestSampleRate = telemetry.guestSampleRate || hostSampleRate;
+    const guestCropBytes = Math.floor(guestCropLength * guestSampleRate) * 4;
+
+    const hostCropLength = (hostCountdownStart + 5.0) - hostRecordingStart;
+    const hostCropBytes = Math.floor(hostCropLength * hostSampleRate) * 4;
+
+    return {
+        hostCropBytes: Math.max(0, hostCropBytes),
+        guestCropBytes: Math.max(0, guestCropBytes),
+        minRTT,
+        startOffset,
+        stopOffset
+    };
+}
+
 function runSyncAndPostProcessing() {
     console.log("Starting Phase 4: Sync & Post-Processing");
 
     const guestCrops = [];
+    let lastCropResult = null;
 
     for (const [guestId] of guests) {
         const tests = guestNetworkTests.get(guestId) || [];
@@ -1097,60 +1221,43 @@ function runSyncAndPostProcessing() {
             continue;
         }
 
-        // Find the network test with the lowest RTT for this guest.
-        let bestTest = null;
-        let minRTT = Infinity;
-
-        tests.forEach(test => {
-            if (!test.T3) return;
-            const rtt = (test.T3 - test.T0) - (test.T2 - test.T1);
-            if (rtt < minRTT) {
-                minRTT = rtt;
-                bestTest = test;
-            }
+        const cropResult = computeCropParams({
+            networkTests: tests,
+            telemetry,
+            stopHandshake: stopHandshake || null,
+            hostCountdownStart,
+            hostRecordingStart,
+            hostSampleRate: localSampleRate
         });
 
-        if (!bestTest) {
+        if (!cropResult) {
             console.error(`No successful network tests for guest ${guestId.slice(-6)}, skipping.`);
             continue;
         }
-
-        const { T0, T1 } = bestTest;
-        const startOffset = (T0 + (minRTT / 2)) - T1;
-
-        // Calculate the clock offset at the time of the stop handshake.
-        let stopOffset = startOffset; // fallback
-        if (stopHandshake && stopHandshake.T7) {
-            const stopRTT = (stopHandshake.T7 - stopHandshake.T4) - (stopHandshake.T6 - stopHandshake.T5);
-            stopOffset = (stopHandshake.T4 + (stopRTT / 2)) - stopHandshake.T5;
-        }
+        lastCropResult = cropResult;
 
         const guestInputLatencyMs = telemetry.guestInputLatency ? (telemetry.guestInputLatency * 1000).toFixed(1) : 'N/A';
-        console.log(`[Sync ${guestId.slice(-6)}] Min RTT: ${(minRTT * 1000).toFixed(2)}ms | Start Offset: ${(startOffset * 1000).toFixed(2)}ms`);
+        console.log(`[Sync ${guestId.slice(-6)}] Min RTT: ${(cropResult.minRTT * 1000).toFixed(2)}ms | Start Offset: ${(cropResult.startOffset * 1000).toFixed(2)}ms`);
         console.log(`[Sync ${guestId.slice(-6)}] Input Latencies - Host: ${(localInputLatency * 1000).toFixed(1)}ms | Guest: ${guestInputLatencyMs}ms`);
 
-        // Both recordings start at the countdown origin (hostCountdownStart + 5.0s).
-        // Crop length is how much audio precedes that origin in each raw file.
-        const mappedGuestStart = telemetry.guestRecordingStart + startOffset;
-        const guestCropLength = (hostCountdownStart + 5.0) - mappedGuestStart;
-
         const guestSampleRate = telemetry.guestSampleRate || localSampleRate;
-        const guestCropBytes = Math.floor(guestCropLength * guestSampleRate) * 4;
-
-        console.log(`[Sync ${guestId.slice(-6)}] Crop Length: ${guestCropLength.toFixed(5)}s | Crop Bytes: ${guestCropBytes} (SR: ${guestSampleRate})`);
+        const guestCropLength = cropResult.guestCropBytes / 4 / guestSampleRate;
+        console.log(`[Sync ${guestId.slice(-6)}] Crop Length: ${guestCropLength.toFixed(5)}s | Crop Bytes: ${cropResult.guestCropBytes} (SR: ${guestSampleRate})`);
 
         guestCrops.push({
             peerId: guestId, // Using peerId as standard naming in IDB/Session format
             guestId,
-            cropBytes: Math.max(0, guestCropBytes)
+            cropBytes: cropResult.guestCropBytes
         });
 
         // Send telemetry to IDB via worker before crop
         audioWorker.postMessage({
             type: 'WRITE_TELEMETRY',
+            takeId: currentTakeId,
             record: {
-                id: `${currentSessionId}_${guestId}`,
+                id: `${currentSessionId}_${currentTakeId}_${guestId}`,
                 sessionId: currentSessionId,
+                takeId: currentTakeId,
                 peerId: guestId,
                 guestName: guests.get(guestId)?.name || 'Guest',
                 guestRecordingStart: telemetry.guestRecordingStart,
@@ -1159,29 +1266,37 @@ function runSyncAndPostProcessing() {
                 isLateJoin: telemetry.isLateJoin,
                 lateJoinTime: telemetry.lateJoinTime,
                 networkTests: guestNetworkTests.get(guestId) || [],
-                bestRTT: minRTT,
-                startOffset: startOffset,
+                bestRTT: cropResult.minRTT,
+                startOffset: cropResult.startOffset,
                 stopHandshake: guestStopHandshakes.get(guestId) || null
             }
         });
     }
 
-    // Compute host crop (same for all guests since it's based on the host timeline).
-    const hostCropLength = (hostCountdownStart + 5.0) - hostRecordingStart;
-    const hostCropBytes = Math.floor(hostCropLength * localSampleRate) * 4;
-    console.log(`[Sync] Host Crop Length: ${hostCropLength.toFixed(5)}s | Crop Bytes: ${hostCropBytes}`);
+    // Host crop is the same regardless of which guest's cropResult we use.
+    // Re-use the value from computeCropParams to avoid a duplicate calculation.
+    // Fall back to direct calculation for solo recordings (no guests).
+    let hostCropBytes;
+    if (lastCropResult) {
+        hostCropBytes = lastCropResult.hostCropBytes;
+    } else {
+        const hostCropLength = (hostCountdownStart + 5.0) - hostRecordingStart;
+        hostCropBytes = Math.max(0, Math.floor(hostCropLength * localSampleRate) * 4);
+    }
+    console.log(`[Sync] Host Crop Bytes: ${hostCropBytes}`);
 
-    if (window.SessionDB && currentSessionId) {
-        window.SessionDB.updateSession(currentSessionId, {
+    if (window.SessionDB && currentTakeId) {
+        window.SessionDB.updateTake(currentTakeId, {
             hostCropBytes: Math.max(0, hostCropBytes),
             guestCrops: guestCrops
-        }).catch(err => console.error('Failed to save crop bytes to DB:', err));
+        }).catch(err => console.error('Failed to save crop bytes to take in DB:', err));
     }
 
     audioWorker.postMessage({
         type: 'CROP_FILES',
         hostCropBytes: Math.max(0, hostCropBytes),
-        guestCrops
+        guestCrops,
+        takeId: currentTakeId
     });
 
     console.log(`Commanded worker to crop files for ${guestCrops.length} guest(s).`);
@@ -1193,10 +1308,13 @@ window.AudioSync = {
     initGuest,
     startRecordingProcess,
     stopRecordingProcess,
+    startTake,
+    stopTake,
     switchMicrophone,
     leaveSession,
     endMeeting,
     setMuted,
+    computeCropParams,
     downloadTrack: downloadAsWav,
     deleteFiles: async function(fileNames) {
         if (audioWorker) {

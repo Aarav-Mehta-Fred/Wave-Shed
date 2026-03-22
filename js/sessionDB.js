@@ -7,7 +7,7 @@ window.SessionDB = {
                 resolve();
                 return;
             }
-            const request = indexedDB.open('waveshed_db', 1);
+            const request = indexedDB.open('waveshed_db', 3);
 
             request.onupgradeneeded = (e) => {
                 const db = e.target.result;
@@ -19,6 +19,18 @@ window.SessionDB = {
                 }
                 if (!db.objectStoreNames.contains('downloads')) {
                     db.createObjectStore('downloads', { keyPath: 'id' });
+                }
+                if (e.oldVersion < 2) {
+                    const takesStore = db.createObjectStore('takes', { keyPath: 'takeId' });
+                    takesStore.createIndex('sessionId', 'sessionId', { unique: false });
+                }
+                if (e.oldVersion < 3) {
+                    const transcriptsStore = db.createObjectStore('transcripts', { keyPath: 'id' });
+                    transcriptsStore.createIndex('sessionId', 'sessionId', { unique: false });
+                    transcriptsStore.createIndex('takeId', 'takeId', { unique: false });
+
+                    const editsStore = db.createObjectStore('edits', { keyPath: 'takeId' });
+                    editsStore.createIndex('sessionId', 'sessionId', { unique: false });
                 }
             };
 
@@ -88,9 +100,90 @@ window.SessionDB = {
         });
     },
 
+    // --- Takes store methods ---
+
+    createTake: function(record) {
+        return new Promise((resolve, reject) => {
+            const tx = this.db.transaction('takes', 'readwrite');
+            const store = tx.objectStore('takes');
+            const request = store.add(record);
+            request.onsuccess = () => resolve();
+            request.onerror = (e) => reject(e.target.error);
+        });
+    },
+
+    updateTake: function(takeId, partial) {
+        return new Promise((resolve, reject) => {
+            const tx = this.db.transaction('takes', 'readwrite');
+            const store = tx.objectStore('takes');
+            const request = store.get(takeId);
+
+            request.onsuccess = (e) => {
+                const record = e.target.result;
+                if (!record) {
+                    reject(new Error(`Take ${takeId} not found`));
+                    return;
+                }
+                const updated = { ...record, ...partial };
+                const updateRequest = store.put(updated);
+                updateRequest.onsuccess = () => resolve();
+                updateRequest.onerror = (e) => reject(e.target.error);
+            };
+            request.onerror = (e) => reject(e.target.error);
+        });
+    },
+
+    getTake: function(takeId) {
+        return new Promise((resolve, reject) => {
+            const tx = this.db.transaction('takes', 'readonly');
+            const store = tx.objectStore('takes');
+            const request = store.get(takeId);
+            request.onsuccess = (e) => resolve(e.target.result || null);
+            request.onerror = (e) => reject(e.target.error);
+        });
+    },
+
+    getSessionTakes: function(sessionId) {
+        return new Promise((resolve, reject) => {
+            const tx = this.db.transaction('takes', 'readonly');
+            const store = tx.objectStore('takes');
+            const index = store.index('sessionId');
+            const request = index.getAll(IDBKeyRange.only(sessionId));
+            request.onsuccess = (e) => {
+                const takes = e.target.result || [];
+                takes.sort((a, b) => a.startedAt - b.startedAt);
+                resolve(takes);
+            };
+            request.onerror = (e) => reject(e.target.error);
+        });
+    },
+
+    deleteTake: function(takeId) {
+        return new Promise((resolve, reject) => {
+            const tx = this.db.transaction('takes', 'readwrite');
+            const store = tx.objectStore('takes');
+            const request = store.delete(takeId);
+            request.onsuccess = () => resolve();
+            request.onerror = (e) => reject(e.target.error);
+        });
+    },
+
+    // --- Updated deleteSessions to cascade to takes ---
+
     deleteSessions: function(id) {
         return new Promise((resolve, reject) => {
-            const tx = this.db.transaction(['sessions', 'telemetry', 'downloads'], 'readwrite');
+            const storeNames = ['sessions', 'telemetry', 'downloads'];
+            // Only include stores if they exist (handles v1/v2 databases gracefully)
+            if (this.db.objectStoreNames.contains('takes')) {
+                storeNames.push('takes');
+            }
+            if (this.db.objectStoreNames.contains('transcripts')) {
+                storeNames.push('transcripts');
+            }
+            if (this.db.objectStoreNames.contains('edits')) {
+                storeNames.push('edits');
+            }
+            const tx = this.db.transaction(storeNames, 'readwrite');
             const sessionsStore = tx.objectStore('sessions');
             const telemetryStore = tx.objectStore('telemetry');
             const downloadsStore = tx.objectStore('downloads');
@@ -118,6 +211,48 @@ window.SessionDB = {
                     }
                 });
             };
+
+            // Delete associated takes using the sessionId index
+            if (this.db.objectStoreNames.contains('takes')) {
+                const takesStore = tx.objectStore('takes');
+                const takesIndex = takesStore.index('sessionId');
+                const takesRequest = takesIndex.openCursor(IDBKeyRange.only(id));
+                takesRequest.onsuccess = (e) => {
+                    const cursor = e.target.result;
+                    if (cursor) {
+                        cursor.delete();
+                        cursor.continue();
+                    }
+                };
+            }
+
+            // Delete associated transcripts using the sessionId index
+            if (this.db.objectStoreNames.contains('transcripts')) {
+                const transcriptsStore = tx.objectStore('transcripts');
+                const transcriptsIndex = transcriptsStore.index('sessionId');
+                const transcriptsRequest = transcriptsIndex.openCursor(IDBKeyRange.only(id));
+                transcriptsRequest.onsuccess = (e) => {
+                    const cursor = e.target.result;
+                    if (cursor) {
+                        cursor.delete();
+                        cursor.continue();
+                    }
+                };
+            }
+
+            // Delete associated edits using the sessionId index
+            if (this.db.objectStoreNames.contains('edits')) {
+                const editsStore = tx.objectStore('edits');
+                const editsIndex = editsStore.index('sessionId');
+                const editsRequest = editsIndex.openCursor(IDBKeyRange.only(id));
+                editsRequest.onsuccess = (e) => {
+                    const cursor = e.target.result;
+                    if (cursor) {
+                        cursor.delete();
+                        cursor.continue();
+                    }
+                };
+            }
 
             tx.oncomplete = () => resolve();
             tx.onerror = (e) => reject(e.target.error);
@@ -168,6 +303,134 @@ window.SessionDB = {
                 const sessionDownloads = allDownloads.filter(d => d.sessionId === sessionId);
                 resolve(sessionDownloads);
             };
+            request.onerror = (e) => reject(e.target.error);
+        });
+    },
+
+    // --- Transcript store methods ---
+
+    createTranscript: function(record) {
+        return new Promise((resolve, reject) => {
+            const tx = this.db.transaction('transcripts', 'readwrite');
+            const store = tx.objectStore('transcripts');
+            const request = store.add(record);
+            request.onsuccess = () => resolve();
+            request.onerror = (e) => reject(e.target.error);
+        });
+    },
+
+    updateTranscript: function(id, partial) {
+        return new Promise((resolve, reject) => {
+            const tx = this.db.transaction('transcripts', 'readwrite');
+            const store = tx.objectStore('transcripts');
+            const request = store.get(id);
+
+            request.onsuccess = (e) => {
+                const record = e.target.result;
+                if (!record) {
+                    reject(new Error(`Transcript ${id} not found`));
+                    return;
+                }
+                const updated = { ...record, ...partial };
+                const updateRequest = store.put(updated);
+                updateRequest.onsuccess = () => resolve();
+                updateRequest.onerror = (e) => reject(e.target.error);
+            };
+            request.onerror = (e) => reject(e.target.error);
+        });
+    },
+
+    upsertTranscript: function(record) {
+        return new Promise((resolve, reject) => {
+            const tx = this.db.transaction('transcripts', 'readwrite');
+            const store = tx.objectStore('transcripts');
+            const request = store.put(record);
+            request.onsuccess = () => resolve();
+            request.onerror = (e) => reject(e.target.error);
+        });
+    },
+
+    getTranscript: function(takeId, peerId) {
+        return new Promise((resolve, reject) => {
+            const tx = this.db.transaction('transcripts', 'readonly');
+            const store = tx.objectStore('transcripts');
+            const request = store.get(`${takeId}_${peerId}`);
+            request.onsuccess = (e) => resolve(e.target.result || null);
+            request.onerror = (e) => reject(e.target.error);
+        });
+    },
+
+    getSessionTranscripts: function(sessionId) {
+        return new Promise((resolve, reject) => {
+            const tx = this.db.transaction('transcripts', 'readonly');
+            const store = tx.objectStore('transcripts');
+            const index = store.index('sessionId');
+            const request = index.getAll(IDBKeyRange.only(sessionId));
+            request.onsuccess = (e) => resolve(e.target.result || []);
+            request.onerror = (e) => reject(e.target.error);
+        });
+    },
+
+    getTakeTranscripts: function(takeId) {
+        return new Promise((resolve, reject) => {
+            const tx = this.db.transaction('transcripts', 'readonly');
+            const store = tx.objectStore('transcripts');
+            const index = store.index('takeId');
+            const request = index.getAll(IDBKeyRange.only(takeId));
+            request.onsuccess = (e) => resolve(e.target.result || []);
+            request.onerror = (e) => reject(e.target.error);
+        });
+    },
+
+    // --- Edits store methods ---
+
+    createEdits: function(record) {
+        return new Promise((resolve, reject) => {
+            const tx = this.db.transaction('edits', 'readwrite');
+            const store = tx.objectStore('edits');
+            const request = store.add(record);
+            request.onsuccess = () => resolve();
+            request.onerror = (e) => reject(e.target.error);
+        });
+    },
+
+    updateEdits: function(takeId, partial) {
+        return new Promise((resolve, reject) => {
+            const tx = this.db.transaction('edits', 'readwrite');
+            const store = tx.objectStore('edits');
+            const request = store.get(takeId);
+
+            request.onsuccess = (e) => {
+                const record = e.target.result;
+                if (!record) {
+                    reject(new Error(`Edits for take ${takeId} not found`));
+                    return;
+                }
+                const updated = { ...record, ...partial };
+                const updateRequest = store.put(updated);
+                updateRequest.onsuccess = () => resolve();
+                updateRequest.onerror = (e) => reject(e.target.error);
+            };
+            request.onerror = (e) => reject(e.target.error);
+        });
+    },
+
+    upsertEdits: function(record) {
+        return new Promise((resolve, reject) => {
+            const tx = this.db.transaction('edits', 'readwrite');
+            const store = tx.objectStore('edits');
+            const request = store.put(record);
+            request.onsuccess = () => resolve();
+            request.onerror = (e) => reject(e.target.error);
+        });
+    },
+
+    getEdits: function(takeId) {
+        return new Promise((resolve, reject) => {
+            const tx = this.db.transaction('edits', 'readonly');
+            const store = tx.objectStore('edits');
+            const request = store.get(takeId);
+            request.onsuccess = (e) => resolve(e.target.result || null);
             request.onerror = (e) => reject(e.target.error);
         });
     }

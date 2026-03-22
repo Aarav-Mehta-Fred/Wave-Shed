@@ -7,6 +7,7 @@ window.app = {
 
     sessionState: 'idle', // 'idle' | 'in_meeting' | 'recording' | 'transferring'
     selectedMicId: null,
+    lastCompletedTakeId: null,
 
     // Local participant info
     localName: '',
@@ -154,6 +155,7 @@ window.app = {
 
     onMeetingEnded: function() {
         console.log('[UI] The host has ended the session.');
+        this.lastCompletedTakeId = null;
         // Disable controls or redirect
         this.setSessionState('idle');
     },
@@ -177,18 +179,46 @@ window.app = {
                 createdAt: Date.now(),
                 hostName: hostName,
                 status: 'recording',
-                rawHostFile: rawHostFileName || '',
+                roomName: new Date().toLocaleDateString('en-GB', {
+                    day: 'numeric', month: 'long', year: 'numeric'
+                }),
+                activeTakeId: null,
+                sampleRate: localSampleRate || 44100
+            });
+        } catch(e) {
+            console.error('[SessionDB] onSessionCreated error:', e);
+        }
+    },
+
+    /**
+     * Called by audio.js from the TAKE_READY worker message.
+     * Creates a new take record in IndexedDB.
+     */
+    onTakeCreated: async function(takeId, takeName, rawHostFile, sessionId) {
+        if (!window.SessionDB) return;
+        try {
+            // Close the rename window for the previous take
+            this.lastCompletedTakeId = null;
+
+            await window.SessionDB.createTake({
+                takeId,
+                sessionId,
+                name: takeName,
+                startedAt: Date.now(),
+                endedAt: null,
+                status: 'recording',
+                rawHostFile: rawHostFile || '',
                 rawGuestFiles: {},
                 alignedHostFile: '',
                 alignedGuestFiles: {},
                 hostCropBytes: 0,
                 guestCrops: [],
                 participants: [],
-                durationSecs: 0,
-                sampleRate: localSampleRate || 44100
+                durationSecs: 0
             });
+            await window.SessionDB.updateSession(sessionId, { activeTakeId: takeId });
         } catch(e) {
-            console.error('[SessionDB] onSessionCreated error:', e);
+            console.error('[SessionDB] onTakeCreated error:', e);
         }
     },
 
@@ -202,11 +232,15 @@ window.app = {
         if (!window.SessionDB) return;
         try {
             if (!sessionId) return;
+            // Find the active take for this session
             const session = await window.SessionDB.getSession(sessionId);
-            if (session) {
-                const updatedFiles = session.rawGuestFiles || {};
-                updatedFiles[guestId] = fileName;
-                await window.SessionDB.updateSession(sessionId, { rawGuestFiles: updatedFiles });
+            if (session && session.activeTakeId) {
+                const take = await window.SessionDB.getTake(session.activeTakeId);
+                if (take) {
+                    const updatedFiles = take.rawGuestFiles || {};
+                    updatedFiles[guestId] = fileName;
+                    await window.SessionDB.updateTake(session.activeTakeId, { rawGuestFiles: updatedFiles });
+                }
             }
         } catch(e) {
             console.error('[SessionDB] onGuestFileCreated error:', e);
@@ -215,12 +249,9 @@ window.app = {
 
     /**
      * Called by audio.js from the CROP_DONE handler.
-     * Updates the session record: sets status to 'complete', stores alignedHostFile,
-     * alignedGuestFiles, hostCropBytes, guestCrops, durationSecs, and participants.
-     * @param {string} sessionId
-     * @param {{ hostFile: string, guestFiles: { [peerId]: string } }} alignedFiles
+     * Updates the take record to 'complete' with raw filenames and crop offsets.
      */
-    onProcessingComplete: async function(sessionId, alignedFiles, guests, guestTelemetryMap, localSampleRate) {
+    onTakeComplete: async function(takeId, rawHostFile, hostCropBytes, guestFiles, guests, guestTelemetryMap, localSampleRate, sessionId) {
         if (!window.SessionDB) return;
         try {
             const participants = [];
@@ -235,29 +266,90 @@ window.app = {
                     });
                 }
             }
-            
+
+            // Duration calculation is best-effort — failure must not block the take record update.
             let durationSecs = 0;
             try {
                 const root = await navigator.storage.getDirectory();
-                const h = await root.getFileHandle(alignedFiles.hostFile);
+                const h = await root.getFileHandle(rawHostFile);
                 const f = await h.getFile();
                 const sr = localSampleRate || 44100;
-                durationSecs = f.size / (sr * 4);
+                durationSecs = (f.size - (hostCropBytes || 0)) / (sr * 4);
             } catch(e) {
                 console.error('[SessionDB] Could not compute duration:', e);
             }
 
-            // hostCropBytes and guestCrops are already saved in runSyncAndPostProcessing!
-            await window.SessionDB.updateSession(sessionId, {
+            await window.SessionDB.updateTake(takeId, {
                 status: 'complete',
-                alignedHostFile: alignedFiles.hostFile,
-                alignedGuestFiles: alignedFiles.guestFiles,
+                endedAt: Date.now(),
+                rawHostFile: rawHostFile,
+                rawGuestFiles: Object.fromEntries(
+                    Object.entries(guestFiles).map(([id, g]) => [id, g.fileName])
+                ),
+                hostCropBytes: hostCropBytes,
+                guestCrops: Object.entries(guestFiles).map(([guestId, g]) => ({
+                    guestId,
+                    cropBytes: g.cropBytes
+                })),
+                // ai.js populates these later — initialise as null/empty now:
+                noiseCanceledHostFile: null,
+                noiseCanceledGuestFiles: {},
+                transcriptId: null,
+                editListId: null,
                 participants: participants,
                 durationSecs: durationSecs
             });
+
+            // Clear activeTakeId on the session now that this take is complete.
+            if (sessionId) {
+                await window.SessionDB.updateSession(sessionId, { activeTakeId: null });
+            }
+
+            this.lastCompletedTakeId = takeId;
         } catch(e) {
-            console.error('[SessionDB] onProcessingComplete error:', e);
+            console.error('[SessionDB] onTakeComplete error:', e);
         }
+    },
+
+    /**
+     * Called when the meeting ends and all processing is done.
+     */
+    onSessionFinalized: async function(sessionId) {
+        if (!window.SessionDB) return;
+        try {
+            await window.SessionDB.updateSession(sessionId, { status: 'complete' });
+            this.lastCompletedTakeId = null;
+        } catch(e) {
+            console.error('[SessionDB] onSessionFinalized error:', e);
+        }
+    },
+
+    /**
+     * Rename the room (only while session is recording).
+     */
+    renameRoom: async function(sessionId, newName) {
+        const session = await window.SessionDB.getSession(sessionId);
+        if (!session) return;
+        if (session.status !== 'recording') {
+            console.warn('[app] Cannot rename room after meeting has ended.');
+            return;
+        }
+        await window.SessionDB.updateSession(sessionId, { roomName: newName.trim() || session.roomName });
+    },
+
+    /**
+     * Rename a take (only while recording or immediately after completion before next take).
+     */
+    renameTake: async function(takeId, newName) {
+        const take = await window.SessionDB.getTake(takeId);
+        if (!take) return;
+        const isActive = take.status === 'recording';
+        const isLastCompleted = takeId === this.lastCompletedTakeId;
+        if (!isActive && !isLastCompleted) {
+            console.warn('[app] Rename window has closed for this take.');
+            return;
+        }
+        await window.SessionDB.updateTake(takeId, { name: newName.trim() || take.name });
     },
 
     /**
@@ -275,42 +367,74 @@ window.app = {
     },
 
     /**
+     * Called when an unrecoverable error occurs during a specific take.
+     * Sets the take status to 'error' in IndexedDB.
+     * @param {string} takeId
+     * @param {string} reason
+     */
+    onTakeError: async function(takeId, reason) {
+        if (!window.SessionDB || !takeId) return;
+        try {
+            await window.SessionDB.updateTake(takeId, { status: 'error' });
+            console.error('[Take Error]', takeId, reason);
+        } catch(e) {}
+    },
+
+    /**
      * Triggers a WAV download for a specific track and logs it to the 'downloads' store.
      * @param {string} sessionId
      * @param {'raw_host'|'raw_guest'|'aligned_host'|'aligned_guest'} type
      * @param {string|null} peerId
      */
-    requestDownload: async function(sessionId, type, peerId = null) {
+    requestDownload: async function(sessionId, type, peerId = null, takeId = null) {
         if (!window.SessionDB) return;
         try {
             const session = await window.SessionDB.getSession(sessionId);
             if (!session) return;
             
-            let fileName = null;
             let sampleRate = session.sampleRate || 44100;
-            
-            if (type === 'raw_host') fileName = session.rawHostFile;
-            else if (type === 'raw_guest') {
-                fileName = (session.rawGuestFiles || {})[peerId];
-                if (session.participants) {
-                    const p = session.participants.find(p => p.peerId === peerId);
-                    if (p && p.sampleRate) sampleRate = p.sampleRate;
+            let roomName = session.roomName || '';
+            let takeName = '';
+            let participantName = '';
+
+            // If takeId is provided, look up the take record for filenames
+            let take = null;
+            if (takeId) {
+                take = await window.SessionDB.getTake(takeId);
+            }
+            const source = take || session;
+            takeName = take ? (take.name || '') : '';
+
+            // Determine which raw file and crop offset to use
+            let rawFileName = null;
+            let cropBytes = 0;
+
+            if (type === 'raw_host' || type === 'aligned_host') {
+                rawFileName = source.rawHostFile;
+                cropBytes = (type === 'aligned_host') ? (take?.hostCropBytes ?? source.hostCropBytes ?? 0) : 0;
+                participantName = session.hostName || 'Host';
+            } else if (type === 'raw_guest' || type === 'aligned_guest') {
+                rawFileName = (source.rawGuestFiles || {})[peerId];
+                if (type === 'aligned_guest') {
+                    const guestCropEntry = (take?.guestCrops || source.guestCrops || []).find(c => c.guestId === peerId);
+                    cropBytes = guestCropEntry?.cropBytes ?? 0;
+                }
+                participantName = peerId || 'Guest';
+                if (source.participants) {
+                    const p = source.participants.find(p => p.peerId === peerId);
+                    if (p) {
+                        if (p.sampleRate) sampleRate = p.sampleRate;
+                        if (p.name) participantName = p.name;
+                    }
                 }
             }
-            else if (type === 'aligned_host') fileName = session.alignedHostFile;
-            else if (type === 'aligned_guest') {
-                fileName = (session.alignedGuestFiles || {})[peerId];
-                if (session.participants) {
-                    const p = session.participants.find(p => p.peerId === peerId);
-                    if (p && p.sampleRate) sampleRate = p.sampleRate;
-                }
-            }
             
-            if (fileName && window.AudioSync && window.AudioSync.downloadTrack) {
-                await window.AudioSync.downloadTrack(fileName, sampleRate);
+            if (rawFileName && window.AudioSync && window.AudioSync.downloadTrack) {
+                await window.AudioSync.downloadTrack(rawFileName, sampleRate, roomName, takeName, participantName, cropBytes);
                 await window.SessionDB.logDownload({
-                    id: `${sessionId}_${type}_${peerId || 'host'}`,
+                    id: `${sessionId}_${takeId || 'notake'}_${type}_${peerId || 'host'}`,
                     sessionId: sessionId,
+                    takeId: takeId || null,
                     type: type,
                     peerId: peerId,
                     downloadedAt: Date.now()
@@ -328,11 +452,29 @@ window.app = {
     requestBulkDownload: async function(sessionId) {
         if (!window.SessionDB) return;
         try {
-            const session = await window.SessionDB.getSession(sessionId);
-            if (!session) return;
-            await this.requestDownload(sessionId, 'aligned_host');
-            for (const peerId of Object.keys(session.alignedGuestFiles || {})) {
-                await this.requestDownload(sessionId, 'aligned_guest', peerId);
+            const takes = await window.SessionDB.getSessionTakes(sessionId);
+            const completedTakes = takes.filter(t => t.status === 'complete');
+            
+            if (completedTakes.length === 0) {
+                // Fallback for v1 sessions with no takes
+                const session = await window.SessionDB.getSession(sessionId);
+                if (!session) return;
+                if (session.rawHostFile || session.alignedHostFile) {
+                    await this.requestDownload(sessionId, 'aligned_host');
+                }
+                const guestFiles = session.rawGuestFiles || session.alignedGuestFiles || {};
+                for (const peerId of Object.keys(guestFiles)) {
+                    await this.requestDownload(sessionId, 'aligned_guest', peerId);
+                }
+                return;
+            }
+            
+            for (const take of completedTakes) {
+                await this.requestDownload(sessionId, 'aligned_host', null, take.takeId);
+                const guestFiles = take.rawGuestFiles || take.alignedGuestFiles || {};
+                for (const peerId of Object.keys(guestFiles)) {
+                    await this.requestDownload(sessionId, 'aligned_guest', peerId, take.takeId);
+                }
             }
         } catch(e) { console.error('[SessionDB] requestBulkDownload error:', e); }
     },
@@ -352,10 +494,18 @@ window.app = {
      * @returns {Promise<{ session: object, telemetry: object[] }>}
      */
     getSessionDetail: async function(sessionId) {
-        if (!window.SessionDB) return { session: null, telemetry: [] };
+        if (!window.SessionDB) return { session: null, takes: [], telemetry: [], transcripts: [], edits: [] };
         const session = await window.SessionDB.getSession(sessionId);
         const telemetry = await window.SessionDB.getTelemetry(sessionId);
-        return { session, telemetry };
+        let takes = [], transcripts = [], edits = [];
+        try {
+            takes = await window.SessionDB.getSessionTakes(sessionId);
+            transcripts = await window.SessionDB.getSessionTranscripts(sessionId);
+            edits = (await Promise.all(
+                takes.map(t => window.SessionDB.getEdits(t.takeId))
+            )).filter(Boolean);
+        } catch(e) { /* v1/v2 database without these stores */ }
+        return { session, takes, telemetry, transcripts, edits };
     },
 
     /**
@@ -373,19 +523,35 @@ window.app = {
                 return;
             }
 
-            const fileNames = [session.alignedHostFile].filter(Boolean);
+            // Collect filenames from session-level (v1 compat) and from takes
+            const fileNames = [];
+            // v1 compat: session-level aligned files
+            if (session.alignedHostFile) fileNames.push(session.alignedHostFile);
             if (session.alignedGuestFiles) {
                 fileNames.push(...Object.values(session.alignedGuestFiles));
             }
 
+            // v2: raw files from takes
+            try {
+                const takes = await window.SessionDB.getSessionTakes(sessionId);
+                for (const take of takes) {
+                    if (take.rawHostFile) fileNames.push(take.rawHostFile);
+                    if (take.rawGuestFiles) fileNames.push(...Object.values(take.rawGuestFiles));
+                    if (take.noiseCanceledHostFile) fileNames.push(take.noiseCanceledHostFile);
+                    if (take.noiseCanceledGuestFiles) fileNames.push(...Object.values(take.noiseCanceledGuestFiles));
+                }
+            } catch(e) { /* v1 database */ }
+
+            const uniqueFiles = [...new Set(fileNames.filter(Boolean))];
+
             let dispatched = false;
             if (window.AudioSync && window.AudioSync.deleteFiles) {
-                dispatched = await window.AudioSync.deleteFiles(fileNames);
+                dispatched = await window.AudioSync.deleteFiles(uniqueFiles);
             }
 
             if (!dispatched) {
                 const root = await navigator.storage.getDirectory();
-                for (const fileName of fileNames) {
+                for (const fileName of uniqueFiles) {
                     try {
                         const h = await root.getFileHandle(fileName);
                         await h.remove();
