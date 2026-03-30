@@ -13,3 +13,6 @@ WaveShed is a free, open-source, privacy focused tool to help you record and edi
 - Smart Silence Removal : Auto detects large gaps in speech and reduces them
 - Umm Detector : Detects filler words (“uhms”) and stutters from the transcript or otherwise and removes them.
 
+## Self-Hosting
+
+Want to run Wave Shed entirely on your own infrastructure? Check out our [Self-Hosting Guide](./docs/self-hosting.md) for step-by-step instructions on deploying the static frontend and setting up your own PeerJS signaling server using free-tier platforms like Netlify and Koyeb.

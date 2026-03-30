@@ -317,7 +317,7 @@
             const isGuestURL = !!urlParams.get('meeting');
 
             // Name input
-            const nameInput = input('enter your name', 'tui-name', {
+            const nameInput = input('what would you like to go by today', 'tui-name', {
                 value: window.app.localName || '',
                 maxlength: 32
             });
@@ -325,7 +325,7 @@
 
             if (!isGuestURL) {
                 // Session name input (optional)
-                const sessionNameInput = input('session name (optional)', 'tui-session-name', {
+                const sessionNameInput = input('meeting name (optional)', 'tui-session-name', {
                     maxlength: 64
                 });
                 s.appendChild(promptLine('> room name:', sessionNameInput));
