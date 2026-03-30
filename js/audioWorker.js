@@ -193,7 +193,7 @@ async function processMessage(msg, ports) {
     }
     else if (msg.type === 'OPEN_DB') {
         return new Promise((resolve, reject) => {
-            const request = indexedDB.open('waveshed_db', 3);
+            const request = indexedDB.open('waveshed_db', 5);
 
             request.onupgradeneeded = (e) => {
                 const db = e.target.result;
@@ -206,15 +206,16 @@ async function processMessage(msg, ports) {
                 if (!db.objectStoreNames.contains('downloads')) {
                     db.createObjectStore('downloads', { keyPath: 'id' });
                 }
-                if (e.oldVersion < 2) {
+                if (!db.objectStoreNames.contains('takes')) {
                     const takesStore = db.createObjectStore('takes', { keyPath: 'takeId' });
                     takesStore.createIndex('sessionId', 'sessionId', { unique: false });
                 }
-                if (e.oldVersion < 3) {
+                if (!db.objectStoreNames.contains('transcripts')) {
                     const transcriptsStore = db.createObjectStore('transcripts', { keyPath: 'id' });
                     transcriptsStore.createIndex('sessionId', 'sessionId', { unique: false });
                     transcriptsStore.createIndex('takeId', 'takeId', { unique: false });
-
+                }
+                if (!db.objectStoreNames.contains('edits')) {
                     const editsStore = db.createObjectStore('edits', { keyPath: 'takeId' });
                     editsStore.createIndex('sessionId', 'sessionId', { unique: false });
                 }

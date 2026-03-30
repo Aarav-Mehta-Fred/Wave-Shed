@@ -1,0 +1,342 @@
+/* ======================================================
+   Wave Shed — Frutiger Aero / Y2K Console UI
+   Full-screen aqua terminal aesthetic
+   ====================================================== */
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Michroma&family=JetBrains+Mono:wght@400;600&display=swap');
+
+:root {
+    /* Frutiger Aero palette */
+    --bg-top:      #011e3b;
+    --bg-bot:      #008080;
+    --bg-panel:    rgba(255, 255, 255, 0.1);
+    --bg-input:    rgba(0, 0, 0, 0.2);
+
+    --cyan:        #5dfdff;
+    --cyan-dim:    #00b7c7;
+    --cyan-glow:   rgba(93, 253, 255, 0.6);
+    --green:       #52ffb8;
+    --amber:       #ffc400;
+    --red:         #ff4a4a;
+    --white:       #f0fbff;
+    --white-bright:#ffffff;
+    --muted:       #8ab4f8;
+    --border:      rgba(255, 255, 255, 0.2);
+
+    --font: 'Inter', sans-serif;
+    --font-mono: 'JetBrains Mono', monospace;
+    --font-header: 'Michroma', sans-serif;
+    --line-height: 1.55;
+}
+
+/* Reset */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+    height: 100%;
+    overflow: hidden;
+    background: linear-gradient(to bottom, var(--bg-top), var(--bg-bot));
+    color: var(--white);
+    font-family: var(--font);
+    font-size: 14px;
+    line-height: var(--line-height);
+    -webkit-font-smoothing: antialiased;
+    cursor: default;
+    position: relative;
+}
+
+/* ── Bubbles ──────────────────────────── */
+#bubbles {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    overflow: hidden;
+    z-index: 0;
+    pointer-events: none;
+}
+.bubble {
+    position: absolute;
+    bottom: -100px;
+    border-radius: 50%;
+    background: radial-gradient(circle at 30% 30%, rgba(255,255,255,0.8), rgba(255,255,255,0.1) 60%, transparent 80%);
+    box-shadow: inset 0 0 20px rgba(255,255,255,0.5), 0 0 10px rgba(255,255,255,0.2);
+    animation: rise infinite ease-in;
+}
+@keyframes rise {
+    0% { transform: translateY(0) scale(1) rotate(0deg); opacity: 0; }
+    10% { opacity: 0.8; }
+    90% { opacity: 0.8; }
+    100% { transform: translateY(-120vh) scale(1.5) rotate(360deg); opacity: 0; }
+}
+
+/* ── Shell layout ─────────────────────── */
+#terminal {
+    position: relative;
+    z-index: 1;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    overflow: hidden;
+    background: rgba(0, 20, 40, 0.4);
+    backdrop-filter: blur(8px);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+/* ── Screen area ──────────────────────── */
+#screen {
+    flex: 1;
+    padding: 16px 24px;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--cyan-dim) transparent;
+}
+
+#screen::-webkit-scrollbar { width: 6px; }
+#screen::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.3); border-radius: 3px; }
+
+/* ── ASCII art & text ─────────────────── */
+.ascii {
+    white-space: pre;
+    color: var(--white-bright);
+    line-height: 1.15;
+    font-size: 14px;
+    font-family: var(--font-mono);
+    letter-spacing: 2px;
+}
+
+.ascii-title {
+    color: var(--white-bright);
+    text-shadow: 0 0 12px var(--cyan-glow), 0 0 24px var(--cyan-glow);
+    background: linear-gradient(180deg, #ffffff 0%, #aae4ff 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    margin-bottom: 20px;
+}
+
+.dim { color: var(--muted); }
+.cyan { color: var(--cyan); }
+.green { color: var(--green); text-shadow: 0 0 8px rgba(82,255,184,0.5); }
+.amber { color: var(--amber); text-shadow: 0 0 8px rgba(255,196,0,0.5); }
+.red { color: var(--red); text-shadow: 0 0 8px rgba(255,74,74,0.5); }
+.white { color: var(--white-bright); }
+.bold { font-weight: 600; }
+.underline { text-decoration: underline; text-underline-offset: 2px; }
+
+/* ── Box drawing ──────────────────────── */
+.box-line {
+    color: var(--cyan-dim);
+    font-family: var(--font-mono);
+    user-select: none;
+    opacity: 0.6;
+}
+
+/* ── Interactive elements ─────────────── */
+
+/* Glossy Drop Buttons */
+.tui-btn {
+    display: inline-block;
+    color: var(--white-bright);
+    cursor: pointer;
+    padding: 4px 14px;
+    border: 1px solid rgba(255,255,255,0.4);
+    border-radius: 20px;
+    background: linear-gradient(180deg, rgba(255,255,255,0.2) 0%, rgba(255,255,255,0.05) 100%);
+    box-shadow: inset 0 1px 1px rgba(255,255,255,0.6), 0 2px 4px rgba(0,0,0,0.2);
+    backdrop-filter: blur(4px);
+    font-family: var(--font);
+    font-weight: 600;
+    font-size: 13px;
+    line-height: var(--line-height);
+    transition: all 0.2s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+    user-select: none;
+    outline: none;
+    text-align: center;
+    white-space: nowrap;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.3);
+}
+
+.tui-btn:hover, .tui-btn:focus-visible {
+    transform: translateY(-1px) scale(1.02);
+    background: linear-gradient(180deg, rgba(255,255,255,0.3) 0%, rgba(255,255,255,0.1) 100%);
+    box-shadow: inset 0 1px 2px rgba(255,255,255,0.8), 0 4px 8px rgba(0,0,0,0.3), 0 0 10px var(--cyan-glow);
+    border-color: rgba(255,255,255,0.6);
+}
+
+.tui-btn:active {
+    transform: translateY(1px);
+    box-shadow: inset 0 2px 4px rgba(0,0,0,0.3), 0 1px 2px rgba(0,0,0,0.2);
+}
+
+.tui-btn.btn-green {
+    background: linear-gradient(180deg, rgba(82,255,184,0.3) 0%, rgba(82,255,184,0.1) 100%);
+    border-color: rgba(82,255,184,0.5);
+}
+.tui-btn.btn-green:hover { box-shadow: inset 0 1px 2px rgba(255,255,255,0.8), 0 4px 8px rgba(0,0,0,0.3), 0 0 12px rgba(82,255,184,0.4); }
+
+.tui-btn.btn-red {
+    background: linear-gradient(180deg, rgba(255,74,74,0.3) 0%, rgba(255,74,74,0.1) 100%);
+    border-color: rgba(255,74,74,0.5);
+    color: #ffd6d6;
+}
+.tui-btn.btn-red:hover { box-shadow: inset 0 1px 2px rgba(255,255,255,0.8), 0 4px 8px rgba(0,0,0,0.3), 0 0 12px rgba(255,74,74,0.4); color: #fff; }
+
+.tui-btn.btn-amber {
+    background: linear-gradient(180deg, rgba(255,196,0,0.3) 0%, rgba(255,196,0,0.1) 100%);
+    border-color: rgba(255,196,0,0.5);
+}
+.tui-btn.btn-amber:hover { box-shadow: inset 0 1px 2px rgba(255,255,255,0.8), 0 4px 8px rgba(0,0,0,0.3), 0 0 12px rgba(255,196,0,0.4); }
+
+.tui-btn.disabled {
+    opacity: 0.5;
+    pointer-events: none;
+    filter: grayscale(100%);
+}
+
+/* Inline inputs */
+.tui-input {
+    background: rgba(0,0,0,0.3);
+    border: 1px solid rgba(255,255,255,0.2);
+    border-radius: 6px;
+    color: var(--white-bright);
+    font-family: var(--font);
+    font-size: 14px;
+    padding: 6px 12px;
+    outline: none;
+    caret-color: var(--cyan);
+    transition: all 0.2s;
+    width: 100%;
+    max-width: 42ch;
+    box-shadow: inset 0 1px 3px rgba(0,0,0,0.5);
+}
+
+.tui-input:focus {
+    border-color: var(--cyan);
+    background: rgba(0,0,0,0.4);
+    box-shadow: inset 0 1px 3px rgba(0,0,0,0.5), 0 0 8px rgba(93,253,255,0.3);
+}
+
+.tui-input::placeholder { color: var(--muted); }
+.tui-input.shake { animation: shake 0.4s; border-color: var(--red); }
+@keyframes shake {
+    0%, 100% { transform: translateX(0); }
+    25% { transform: translateX(-4px); }
+    75% { transform: translateX(4px); }
+}
+
+/* Inline select */
+.tui-select {
+    background: rgba(0,0,0,0.3);
+    border: 1px solid rgba(255,255,255,0.2);
+    border-radius: 6px;
+    color: var(--white-bright);
+    font-family: var(--font);
+    font-size: 14px;
+    padding: 6px 12px;
+    outline: none;
+    cursor: pointer;
+    appearance: none;
+    width: 100%;
+    max-width: 42ch;
+    transition: all 0.2s;
+}
+.tui-select:focus { border-color: var(--cyan); }
+.tui-select option { background: #002b4d; color: var(--white); }
+
+/* Toggle (keyboard-style) */
+.tui-toggle {
+    display: inline-block;
+    cursor: pointer;
+    font-family: var(--font);
+    font-size: 14px;
+    user-select: none;
+    color: var(--muted);
+    transition: all 0.2s;
+    background: rgba(0,0,0,0.2);
+    padding: 4px 10px;
+    border-radius: 12px;
+    border: 1px solid rgba(255,255,255,0.1);
+}
+.tui-toggle.on { 
+    color: var(--green); 
+    border-color: rgba(82,255,184,0.4); 
+    background: rgba(82,255,184,0.1); 
+    text-shadow: 0 0 8px rgba(82,255,184,0.4);
+}
+
+/* ── Progress bar (ASCII) ─────────────── */
+.progress-row { margin: 4px 0; }
+
+/* ── REC dot ──────────────────────────── */
+.rec-blink { animation: blink-rec 1s ease-in-out infinite; }
+@keyframes blink-rec { 0%, 100% { opacity: 1; text-shadow: 0 0 10px var(--red); } 50% { opacity: 0.2; text-shadow: none; } }
+
+/* ── Prompt line ──────────────────────── */
+.prompt-line { display: flex; align-items: center; gap: 8px; margin: 8px 0; flex-wrap: wrap; }
+.prompt-label { 
+    color: var(--cyan); 
+    white-space: nowrap; 
+    flex-shrink: 0; 
+    min-width: 14ch; 
+    font-weight: 600; 
+    text-transform: uppercase; 
+    font-size: 11px; 
+    letter-spacing: 1px;
+}
+
+/* ── Roster entry ─────────────────────── */
+.roster-entry { padding: 4px 0; }
+
+/* ── Audio Waveform ───────────────────── */
+.ascii-waveform {
+    font-family: var(--font-mono);
+    color: var(--cyan);
+    margin-left: 8px;
+    font-weight: bold;
+    display: inline-block;
+}
+
+/* ── Action bar ───────────────────────── */
+.action-bar { display: flex; gap: 12px; flex-wrap: wrap; margin: 12px 0; }
+
+/* ── Divider ──────────────────────────── */
+.divider { 
+    color: rgba(255,255,255,0.2); 
+    user-select: none; 
+    margin: 8px 0; 
+    white-space: pre; 
+    overflow: hidden; 
+}
+
+/* ── Scanline overlay (subtle) ────────── */
+#terminal::after {
+    content: '';
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 999;
+    background: repeating-linear-gradient(
+        0deg,
+        transparent,
+        transparent 2px,
+        rgba(0, 0, 0, 0.04) 2px,
+        rgba(0, 0, 0, 0.04) 4px
+    );
+}
+
+/* ── Responsive ───────────────────────── */
+@media (max-width: 500px) {
+    html { font-size: 12px; }
+    #screen { padding: 12px 16px; }
+    .ascii { font-size: 10px; }
+    .tui-input, .tui-select { max-width: 100%; }
+}
+
+@media (min-width: 900px) {
+    html { font-size: 15px; }
+}
+
+/* ── Focus visible ────────────────────── */
+:focus-visible { outline: 1px solid var(--cyan-dim); outline-offset: 1px; }
+
+/* ── Selection ────────────────────────── */
+::selection { background: rgba(93, 253, 255, 0.3); color: var(--white-bright); }
