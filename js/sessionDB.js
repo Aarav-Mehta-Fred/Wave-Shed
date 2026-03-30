@@ -7,7 +7,7 @@ window.SessionDB = {
                 resolve();
                 return;
             }
-            const request = indexedDB.open('waveshed_db', 3);
+            const request = indexedDB.open('waveshed_db', 5);
 
             request.onupgradeneeded = (e) => {
                 const db = e.target.result;
@@ -20,15 +20,16 @@ window.SessionDB = {
                 if (!db.objectStoreNames.contains('downloads')) {
                     db.createObjectStore('downloads', { keyPath: 'id' });
                 }
-                if (e.oldVersion < 2) {
+                if (!db.objectStoreNames.contains('takes')) {
                     const takesStore = db.createObjectStore('takes', { keyPath: 'takeId' });
                     takesStore.createIndex('sessionId', 'sessionId', { unique: false });
                 }
-                if (e.oldVersion < 3) {
+                if (!db.objectStoreNames.contains('transcripts')) {
                     const transcriptsStore = db.createObjectStore('transcripts', { keyPath: 'id' });
                     transcriptsStore.createIndex('sessionId', 'sessionId', { unique: false });
                     transcriptsStore.createIndex('takeId', 'takeId', { unique: false });
-
+                }
+                if (!db.objectStoreNames.contains('edits')) {
                     const editsStore = db.createObjectStore('edits', { keyPath: 'takeId' });
                     editsStore.createIndex('sessionId', 'sessionId', { unique: false });
                 }
@@ -383,6 +384,34 @@ window.SessionDB = {
     },
 
     // --- Edits store methods ---
+
+    /**
+     * JSON SCHEMA FOR EDITS OBJECT STORE
+     * 
+     * Storage for non-destructive edits of a take. All edits are stored as an ordered array 
+     * of operations without modifying the source OPFS files.
+     * 
+     * Record = {
+     *   takeId: string,       // Primary Key (matches takes.takeId)
+     *   sessionId: string,    // Index
+     *   tracks: {
+     *     [peerId: string]: { // peerId is 'host' or the guest's peerId
+     *       muted: boolean,   // Whether the entire track is muted
+     *       volume: number,   // Gain modifier for the track (e.g. 1.0 = normal)
+     *       
+     *       // Ordered array of non-destructive operations applied to this track's timeline
+     *       operations: Array<{
+     *         id: string,       // Unique UUID for the operation
+     *         type: 'cut' | 'silence' | 'insert_gap' | 'vad_silence' | 'noise_suppress',
+     *         startByte: number, // Byte index in the OPFS source file where the op starts
+     *         endByte: number,   // Byte index in the OPFS source file where the op ends
+     *         createdAt: number  // Timestamp of the operation
+     *       }>
+     *     }
+     *   },
+     *   updatedAt: number
+     * }
+     */
 
     createEdits: function(record) {
         return new Promise((resolve, reject) => {

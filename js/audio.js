@@ -7,6 +7,7 @@ let mediaStream = null;
 let commsStream = null; // Separate processed stream for live voice comms
 let pcmProcessor = null;
 let mediaStreamSource = null;
+let localCommsSource = null;
 
 let isHost = false;
 let peerId = null;
@@ -41,6 +42,10 @@ let guestReceivedBytes = new Map(); // guestId -> bytes received so far
 
 let currentTestId = 0;
 let liveCommsPlayers = new Map(); // label -> Audio element
+
+let localAnalyser = null;
+let localDataArray = null;
+let guestAnalysers = new Map(); // label -> { analyser, dataArray }
 
 // Guest-side: the data channel back to the host (there's only one).
 let hostDataChannel = null;
@@ -134,6 +139,18 @@ async function setupAudioPipeline(selectedMicId = null) {
     }
     mediaStreamSource = audioContext.createMediaStreamSource(mediaStream);
     mediaStreamSource.connect(pcmProcessor);
+
+    if (localCommsSource) {
+        localCommsSource.disconnect();
+    }
+    localCommsSource = audioContext.createMediaStreamSource(commsStream);
+
+    if (!localAnalyser) {
+        localAnalyser = audioContext.createAnalyser();
+        localAnalyser.fftSize = 64;
+        localDataArray = new Uint8Array(localAnalyser.frequencyBinCount);
+    }
+    localCommsSource.connect(localAnalyser);
     // Output is intentionally left disconnected - we don't want local monitoring.
     // The pcmProcessor acts as a sink; it must return true in process() to stay alive.
 }
@@ -291,7 +308,7 @@ function initHost(selectedMicId = null, participantInfo = {}, existingMeetingId 
                     window.app.registerGuest(guestId, guestInfo.name || 'Guest');
                 }
 
-                conn.on('open', () => {
+                const finishAdmission = () => {
                     setupGuestDataChannel(guestId, conn);
 
                     // Tell the new guest they're in, along with the roster of existing peers.
@@ -299,7 +316,8 @@ function initHost(selectedMicId = null, participantInfo = {}, existingMeetingId 
                         type: 'ADMISSION_ACCEPTED',
                         roster: roster,
                         hostName: localName,
-                        hostId: peerId
+                        hostId: peerId,
+                        meetingId: existingMeetingId
                     }));
 
                     if (isRecording) {
@@ -319,7 +337,13 @@ function initHost(selectedMicId = null, participantInfo = {}, existingMeetingId 
                         speaker: guestInfo.speaker || ''
                     };
                     broadcastToGuests(newGuestInfo, guestId);
-                });
+                };
+
+                if (conn.open) {
+                    finishAdmission();
+                } else {
+                    conn.on('open', finishAdmission);
+                }
 
                 console.log(`[Host] Admitted guest "${guestInfo.name}" (${guestId})`);
             };
@@ -360,7 +384,7 @@ async function initGuest(roomId, selectedMicId = null, participantInfo = {}, isR
         await setupAudioPipeline(selectedMicId);
         
         if (window.WakeLock) window.WakeLock.acquire();
-        if (window.app && window.app.setSessionState) window.app.setSessionState('in_meeting');
+        if (window.app && window.app.setSessionState) window.app.setSessionState('waiting');
 
         // Connect to the host with our info as metadata.
         hostDataChannel = peer.connect(roomId, {
@@ -375,10 +399,7 @@ async function initGuest(roomId, selectedMicId = null, participantInfo = {}, isR
         });
         setupHostDataChannel(hostDataChannel);
 
-        // Call the host for live voice comms.
-        const hostCall = peer.call(roomId, commsStream);
-        hostCall.on('stream', (stream) => playLiveComms(stream, 'host'));
-        guestVoiceCalls.push(hostCall);
+        // Call logic moved to wait until ADMISSION_ACCEPTED message is received.
 
         // Other guests might call us for voice once the host tells them about us.
         peer.on('call', async (incomingCall) => {
@@ -393,9 +414,30 @@ function playLiveComms(stream, label) {
     let audio = liveCommsPlayers.get(label);
     if (!audio) {
         audio = new Audio();
+        audio.hidden = true;
+        document.body.appendChild(audio);
         liveCommsPlayers.set(label, audio);
         console.log(`[Voice] Created new Audio element for: ${label}`);
     }
+
+    if (audioContext) {
+        if (audioContext.state === 'suspended') audioContext.resume();
+        
+        let hook = guestAnalysers.get(label);
+        // Recreate the analyzer connection if there is no hook or the stream object reference changed
+        if (!hook || hook.stream !== stream) {
+            if (hook && hook.source) hook.source.disconnect();
+
+            const source = audioContext.createMediaStreamSource(stream);
+            const analyser = audioContext.createAnalyser();
+            analyser.fftSize = 64;
+            const dataArray = new Uint8Array(analyser.frequencyBinCount);
+            source.connect(analyser); // We don't connect to destination because `<audio>` element plays it
+            guestAnalysers.set(label, { analyser, dataArray, source, stream });
+            console.log(`[Voice] Hooked analyser for: ${label}`);
+        }
+    }
+
     audio.srcObject = stream;
     audio.play().catch(e => console.warn('[Voice] Autoplay blocked:', e));
     console.log(`[Voice] Playing live comms from: ${label}`);
@@ -406,7 +448,9 @@ function stopLiveComms(label) {
     if (audio) {
         audio.pause();
         audio.srcObject = null;
+        if (audio.parentNode) audio.parentNode.removeChild(audio);
         liveCommsPlayers.delete(label);
+        guestAnalysers.delete(label);
         console.log(`[Voice] Stopped and cleaned up live comms for: ${label}`);
     }
 }
@@ -424,7 +468,7 @@ function setupGuestDataChannel(guestId, conn) {
         stopLiveComms(guestId);
         guests.delete(guestId);
         broadcastToGuests({ type: 'PARTICIPANT_LEFT', name, peerId: guestId });
-        if (window.app && window.app.onParticipantLeft) window.app.onParticipantLeft(name);
+        if (window.app && window.app.onParticipantLeft) window.app.onParticipantLeft(guestId, name);
     });
     conn.on('data', async (data) => {
         let currentChunkSize = 0;
@@ -617,6 +661,8 @@ function handleWorkerMessage(e) {
                 if (window.app && window.app.setSessionState) window.app.setSessionState('idle');
                 if (window.app && window.app.onSessionFinalized) window.app.onSessionFinalized(currentSessionId);
                 endMeetingAfterCrop = false;
+            } else {
+                if (window.app && window.app.setSessionState) window.app.setSessionState('in_meeting');
             }
         })();
     } else if (msg.type === 'FILE_CLOSED') {
@@ -813,7 +859,7 @@ function handleHostDataMessage(guestId, msg) {
             // Notify others
             broadcastToGuests({ type: 'PARTICIPANT_LEFT', name: msg.name, peerId: guestId }, guestId);
             if (window.app && window.app.onParticipantLeft) {
-                window.app.onParticipantLeft(msg.name);
+                window.app.onParticipantLeft(guestId, msg.name);
             }
             break;
         }
@@ -845,17 +891,24 @@ function handleGuestDataMessage(msg) {
         case 'ADMISSION_ACCEPTED': {
             console.log(`[Guest] Admitted to meeting. Host: ${msg.hostName}. Roster: ${msg.roster.length} other guest(s).`);
             
+            if (window.app) {
+                window.app.hostInfo = { peerId: msg.hostId, name: msg.hostName };
+                if (window.app.setSessionState) window.app.setSessionState('in_meeting');
+            }
+
             // Save session info
             localStorage.setItem('waveshed_session', JSON.stringify({
                 role: 'guest',
                 hostId: msg.hostId,
-                guestPeerId: peer.id,
-                participantInfo: {
-                    name: localName,
-                    headphones: localHeadphones,
-                    speaker: localSpeaker
-                }
+                guestPeerId: peerId,
+                meetingId: msg.meetingId,
+                participantInfo: window.app ? window.app.getParticipantInfo() : {}
             }));
+
+            // Call the host for live voice comms now that we are admitted!
+            const hostCall = peer.call(msg.hostId, commsStream);
+            hostCall.on('stream', (stream) => playLiveComms(stream, 'host'));
+            guestVoiceCalls.push(hostCall);
 
             // Call each existing guest for direct voice.
             for (const existing of msg.roster) {
@@ -883,6 +936,15 @@ function handleGuestDataMessage(msg) {
         case 'NEW_GUEST': {
             // Another guest joined. We need to accept their incoming call (handled in peer.on('call')).
             console.log(`[Guest] New guest "${msg.name}" (${msg.peerId.slice(-6)}) joined the meeting`);
+            break;
+        }
+
+        case 'PARTICIPANT_LEFT': {
+            console.log(`[Guest] Participant left: ${msg.name} (${msg.peerId})`);
+            stopLiveComms(msg.peerId);
+            if (window.app && window.app.onParticipantLeft) {
+                window.app.onParticipantLeft(msg.peerId, msg.name);
+            }
             break;
         }
 
@@ -918,7 +980,10 @@ function handleGuestDataMessage(msg) {
             }
 
             setTimeout(() => {
+                guestRecordingStart = audioContext.currentTime;
+                isRecording = true;
                 pcmProcessor.port.postMessage({ command: 'start_recording' });
+                if (window.app && window.app.setSessionState) window.app.setSessionState('recording');
                 console.log('Guest start recording command sent');
             }, 4500 - Math.min((msg.delay * 1000), 1000));
             break;
@@ -928,8 +993,10 @@ function handleGuestDataMessage(msg) {
             const guestStopTime = now;
             // Only stop the worklet here. The actual OPFS file close happens when
             // CMD_EXTRACT arrives, to avoid a double-CLOSING race.
+            isRecording = false;
             pcmProcessor.port.postMessage({ command: 'stop_recording' });
             sendToHost({ type: 'STOP_PONG', T5: guestStopTime, T6: audioContext.currentTime });
+            if (window.app && window.app.setSessionState) window.app.setSessionState('transferring');
             break;
         }
 
@@ -1142,6 +1209,8 @@ function sendTelemetry(extras) {
         ...extras
     };
     sendToHost({ type: 'TELEMETRY_DATA', payload: telemetry });
+    // Guest has transferred all data; leave 'transferring' state so progress UI clears
+    if (window.app && window.app.setSessionState) window.app.setSessionState('in_meeting');
 }
 
 // ==========================================
@@ -1231,7 +1300,11 @@ function runSyncAndPostProcessing() {
         });
 
         if (!cropResult) {
-            console.error(`No successful network tests for guest ${guestId.slice(-6)}, skipping.`);
+            // No valid RTT measurements (e.g. network test fired after stop).
+            // Keep the guest's file at cropBytes=0 — audio is present but may be
+            // a few milliseconds out of sync. Better than silently dropping the track.
+            console.warn(`[Sync] No valid RTT for guest ${guestId.slice(-6)}, using cropBytes=0 (unsynced).`);
+            guestCrops.push({ peerId: guestId, guestId, cropBytes: 0 });
             continue;
         }
         lastCropResult = cropResult;
@@ -1302,6 +1375,23 @@ function runSyncAndPostProcessing() {
     console.log(`Commanded worker to crop files for ${guestCrops.length} guest(s).`);
 }
 
+function getAudioLevels() {
+    const levels = {};
+    if (localAnalyser && localDataArray) {
+        localAnalyser.getByteFrequencyData(localDataArray);
+        let sum = 0;
+        for (let i = 0; i < localDataArray.length; i++) sum += localDataArray[i];
+        levels['local'] = sum / (localDataArray.length * 255);
+    }
+    for (const [id, { analyser, dataArray }] of guestAnalysers) {
+        analyser.getByteFrequencyData(dataArray);
+        let sum = 0;
+        for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+        levels[id] = sum / (dataArray.length * 255);
+    }
+    return levels;
+}
+
 // Expose public API for the UI layer.
 window.AudioSync = {
     initHost,
@@ -1315,6 +1405,7 @@ window.AudioSync = {
     endMeeting,
     setMuted,
     computeCropParams,
+    getAudioLevels,
     downloadTrack: downloadAsWav,
     deleteFiles: async function(fileNames) {
         if (audioWorker) {
@@ -1376,6 +1467,14 @@ async function switchMicrophone(newDeviceId) {
         }
         mediaStreamSource = audioContext.createMediaStreamSource(mediaStream);
         mediaStreamSource.connect(pcmProcessor);
+    }
+
+    if (localAnalyser) {
+        if (localCommsSource) {
+            localCommsSource.disconnect();
+        }
+        localCommsSource = audioContext.createMediaStreamSource(commsStream);
+        localCommsSource.connect(localAnalyser);
     }
 
     // Replace tracks in active calls

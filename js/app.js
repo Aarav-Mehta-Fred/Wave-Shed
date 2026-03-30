@@ -148,9 +148,11 @@ window.app = {
         this.sessionState = state;
     },
 
-    onParticipantLeft: function(name) {
-        console.log(`[UI] Notification: ${name} has left the session.`);
-        // In a real UI, this would show a toast/banner
+    onParticipantLeft: function(peerId, name) {
+        console.log(`[UI] Notification: ${name} (${peerId}) has left the session.`);
+        if (peerId && this.guestRoster[peerId]) {
+            delete this.guestRoster[peerId];
+        }
     },
 
     onMeetingEnded: function() {
@@ -518,10 +520,7 @@ window.app = {
             const session = await window.SessionDB.getSession(sessionId);
             if (!session) return;
 
-            if (session.status === 'recording' || session.status === 'processing') {
-                console.warn(`[SessionDB] Cannot delete session ${sessionId} while it is ${session.status}.`);
-                return;
-            }
+
 
             // Collect filenames from session-level (v1 compat) and from takes
             const fileNames = [];
@@ -563,6 +562,72 @@ window.app = {
         } catch(e) {
             console.error('[SessionDB] deleteSession error:', e);
         }
+    },
+
+    // --- AI and Player Callback Stubs (Phase 1) ---
+
+    /**
+     * Called by ai.js when a task (transcription, VAD, noise suppression) changes state.
+     */
+    onAIStateChange: function(takeId, peerId, taskType, state, progress) {
+        console.log(`[UI/AI] Task ${taskType} for ${peerId} (Take: ${takeId}): ${state} (${progress || 0}%)`);
+    },
+
+    /**
+     * Called by ai.js when a transcript is successfully written to SessionDB.
+     */
+    onTranscriptReady: function(takeId, peerId, transcriptId) {
+        console.log(`[UI/AI] Transcript ready: Take ${takeId}, Peer ${peerId}, ID: ${transcriptId}`);
+    },
+
+    /**
+     * Called by ai.js as it receives streamed word chunks.
+     */
+    onTranscriptProgress: function(takeId, peerId, words) {
+        // console.log(`[UI/AI] Partial transcript for ${peerId} (Take: ${takeId}):`, words);
+    },
+
+    /**
+     * Called by ai.js when an edit operation is decided (cut vs. silence) based on overlaps.
+     */
+    onEditDecision: function(takeId, opType, conflicts) {
+        console.log(`[UI/AI] Edit decision for take ${takeId}: ${opType} (conflicts: ${conflicts.join(', ') || 'none'})`);
+    },
+
+    /**
+     * Called by ai.js whenever the edits array is updated.
+     */
+    onEditStateChanged: function(takeId, editsObject) {
+        console.log(`[UI/AI] Edits state updated for take ${takeId}`);
+    },
+
+    /**
+     * Called by ai.js when VAD finishes evaluating potential cut points globally.
+     */
+    onVADPreview: function(takeId, silenceSpans) {
+        // console.log(`[UI/AI] VAD Preview generated for take ${takeId}: ${silenceSpans.length} spans`);
+    },
+
+    /**
+     * Called by player.js when playback state changes.
+     */
+    onPlayerStateChange: function(state) {
+        console.log(`[UI/Player] State changed: ${state}`);
+    },
+
+    /**
+     * Called by player.js repeatedly during playback.
+     */
+    onPlayerTimeUpdate: function(currentTime) {
+        // Update UI timeline here
+        // console.log(`[UI/Player] Time update: ${currentTime}`);
+    },
+
+    /**
+     * Called by player.js during audio export.
+     */
+    onExportProgress: function(takeId, percentage) {
+        console.log(`[UI/Player] Export progress for take ${takeId}: ${percentage}%`);
     }
 };
 
@@ -613,15 +678,18 @@ window.addEventListener('DOMContentLoaded', async () => {
                 preferredId = savedSession.guestPeerId;
                 isReconnect = dirtyExit;
                 console.log(`[App] Attempting reconnection with preferred ID: ${preferredId}`);
-            }
 
-            window.AudioSync.initGuest(
-                meetingIdParam, 
-                window.app.selectedMicId, 
-                window.app.getParticipantInfo(),
-                isReconnect,
-                preferredId
-            );
+                if (isReconnect) {
+                    window.AudioSync.initGuest(
+                        meetingIdParam, 
+                        window.app.selectedMicId, 
+                        savedSession.participantInfo || window.app.getParticipantInfo(),
+                        isReconnect,
+                        preferredId
+                    );
+                }
+            }
+            // If not a reconnect, let ui.js display the page with pre-filled ID.
         } else if (savedSession && savedSession.role === 'host' && dirtyExit) {
             console.log('[App] Host dirty exit detected, attempting to recover session:', savedSession.meetingId);
             window.AudioSync.initHost(
